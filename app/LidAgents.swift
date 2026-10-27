@@ -207,6 +207,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func perform(_ args: [String]) {
+        // A held hotkey auto-repeats; a second toggle before the first lands would undo it
+        guard !acting else { return }
         acting = true
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Agents.run(args)

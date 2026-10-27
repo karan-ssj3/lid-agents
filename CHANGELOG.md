@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.1
+
+- Holding the hotkey a little too long no longer switches twice: presses are ignored while a switch is still being applied.
+
 ## 1.0.0
 
 First release.
