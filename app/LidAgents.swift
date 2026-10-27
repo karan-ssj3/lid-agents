@@ -134,8 +134,8 @@ struct Hotkey: Equatable {
     let menuKey: String
     let menuModifiers: NSEvent.ModifierFlags
 
-    static let fallback = "ctrl+opt+cmd+a"
-    static let presets = ["ctrl+opt+cmd+a", "ctrl+opt+cmd+l", "ctrl+opt+cmd+k", "ctrl+shift+cmd+space"]
+    static let fallback = "ctrl+0"
+    static let presets = ["ctrl+0", "ctrl+opt+cmd+a", "ctrl+opt+cmd+l", "ctrl+opt+cmd+k", "ctrl+shift+cmd+space"]
 
     static let keys: [String: Int] = [
         "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E, "f": kVK_ANSI_F,

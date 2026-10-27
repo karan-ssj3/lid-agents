@@ -92,7 +92,7 @@ step "Lid Agents will open at login (turn off in its menu)"
 # 6. Start it; first launch asks to send notifications
 open "$APP"
 
-hotkey="$(defaults read "$BUNDLE_ID" Hotkey 2>/dev/null || echo "ctrl+opt+cmd+a")"
+hotkey="$(defaults read "$BUNDLE_ID" Hotkey 2>/dev/null || echo "ctrl+0")"
 echo
 bold "Lid Agents $("$LINK" version | awk '{print $2}') is installed."
 echo "  • Click the cup in the menu bar, or press $hotkey, to keep agents running with the lid closed."

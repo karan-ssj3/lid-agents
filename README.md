@@ -2,7 +2,7 @@
 
 **Close your MacBook's lid and let your AI agents keep working.**
 
-Claude Code, Codex and other terminal agents stop the moment you close the lid, because macOS sleeps. Lid Agents adds a coffee cup to your menu bar. Fill it (click, or press <kbd>⌃⌥⌘A</kbd>) and closing the lid turns the screen off but keeps the Mac awake **while an agent is busy**. When they've all finished, it switches itself back off and puts the closed Mac to sleep.
+Claude Code, Codex and other terminal agents stop the moment you close the lid, because macOS sleeps. Lid Agents adds a coffee cup to your menu bar. Fill it (click, or press <kbd>⌃0</kbd>) and closing the lid turns the screen off but keeps the Mac awake **while an agent is busy**. When they've all finished, it switches itself back off and puts the closed Mac to sleep.
 
 No external display, no keyboard or mouse plugged in, no power adapter required.
 
@@ -16,7 +16,7 @@ curl -fsSL https://github.com/liam-machine/lid-agents/releases/latest/download/i
 
 | You do | What happens |
 |---|---|
-| Click the cup → **Keep agents running with the lid closed** (or press <kbd>⌃⌥⌘A</kbd>) | The cup fills in and shows how many agents are busy. Close the lid whenever. |
+| Click the cup → **Keep agents running with the lid closed** (or press <kbd>⌃0</kbd>) | The cup fills in and shows how many agents are busy. Close the lid whenever. |
 | Close the lid while an agent works | The screen goes off; the agent keeps going. |
 | Your agents finish | About 3 minutes later the cup empties, you get a notification, and a closed Mac goes to sleep. |
 | Click the cup → **Pause agents when the lid closes** | Back to normal: closing the lid sleeps the Mac. |
@@ -60,7 +60,7 @@ Files: `~/Applications/LidAgents.app`, the `agents` link in `~/.local/bin`, a lo
 
 | Setting | Default | How to change |
 |---|---|---|
-| Hotkey | ⌃⌥⌘A | The cup → **Hotkey** → pick a preset, **None**, or **Record New Hotkey…** and press the keys you want. It applies immediately. It needs ⌃, ⌥ or ⌘ with a letter, number or Space. |
+| Hotkey | ⌃0 | The cup → **Hotkey** → pick a preset, **None**, or **Record New Hotkey…** and press the keys you want. It applies immediately. It needs ⌃, ⌥ or ⌘ with a letter, number or Space. |
 | Agents watched | `claude codex gemini aider opencode amp goose cursor-agent droid` | `AGENTS_NAMES` |
 | Idle minutes before pausing | 3 | `AGENTS_IDLE_MINUTES` |
 | CPU % that counts as busy | 5 | `AGENTS_CPU` |

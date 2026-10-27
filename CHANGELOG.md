@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.5
+
+- **The default hotkey is now ⌃0 (Control + 0)**: two keys, and not used by macOS, shells or Claude Code. If you never picked a hotkey, yours changes from ⌃⌥⌘A to ⌃0 with this update. If you did pick one, it stays. ⌃⌥⌘A is still one click away under the cup → **Hotkey**.
+
 ## 1.0.4
 
 - **Choose your hotkey from the menu.** The cup → **Hotkey** offers ⌃⌥⌘A (default), ⌃⌥⌘L, ⌃⌥⌘K, ⌃⇧⌘Space or None, plus **Record New Hotkey…**, a small window where you press the keys you want. The change applies immediately, with no restart. If another app already uses the combination, you're told and the old hotkey stays.
