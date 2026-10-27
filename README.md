@@ -1,0 +1,104 @@
+# Lid Agents
+
+**Close your MacBook's lid and let your AI agents keep working.**
+
+Claude Code, Codex and other terminal agents stop the moment you close the lid, because macOS sleeps. Lid Agents adds a coffee cup to your menu bar. Fill it (click, or press <kbd>⌃⌥⌘A</kbd>) and closing the lid turns the screen off but keeps the Mac awake **while an agent is busy**. When they've all finished, it switches itself back off and puts the closed Mac to sleep.
+
+No external display, no keyboard or mouse plugged in, no power adapter required.
+
+```bash
+curl -fsSL https://github.com/liam-machine/lid-agents/releases/latest/download/install.sh | bash
+```
+
+<sub>macOS 13 or later, Apple Silicon or Intel, on an administrator account. Free and MIT licensed.</sub>
+
+## How you use it
+
+| You do | What happens |
+|---|---|
+| Click the cup → **Keep agents running with the lid closed** (or press <kbd>⌃⌥⌘A</kbd>) | The cup fills in and shows how many agents are busy. Close the lid whenever. |
+| Close the lid while an agent works | The screen goes off; the agent keeps going. |
+| Your agents finish | About 3 minutes later the cup empties, you get a notification, and a closed Mac goes to sleep. |
+| Click the cup → **Pause agents when the lid closes** | Back to normal: closing the lid sleeps the Mac. |
+
+The same controls from a terminal:
+
+```bash
+agents keep            # keep running while agents are busy (8h cap)
+agents keep 2h         # …with a 2-hour cap   (0 = no cap)
+agents keep --always   # even when no agent is busy (3h)
+agents pause           # normal lid-close sleep
+agents                 # status
+agents busy            # which agents count as busy, and in which folder
+```
+
+## Why this needs a tool
+
+macOS has two kinds of sleep:
+
+- **Idle sleep**, when nobody touches the Mac for a while. `caffeinate`, Amphetamine-style apps and Claude Code itself already block it. Claude Code runs `caffeinate -i -t 300` for as long as it's working.
+- **Lid-close sleep**, triggered by the hardware lid sensor. No power assertion can override it. Apple only skips it in "clamshell mode", which needs an external display, keyboard, mouse **and** power.
+
+The one switch that covers the lid is `pmset -a disablesleep 1`. It is global and easy to forget, which is the dangerous part: a Mac that stays awake in a bag gets hot and flattens its battery. Lid Agents handles it for you:
+
+- **Only while agents work.** An agent counts as busy if it has a `caffeinate` child (Claude Code holds one only while working) or uses 5% or more CPU. A session left open and idle in a terminal tab doesn't count.
+- **Turns itself off** after 3 idle minutes, at the 8-hour cap, or when the battery reaches 15%. If the lid is closed when that happens, the Mac goes to sleep straight away.
+- **The screen still turns off.** The lid sensor switches off the built-in display; only system sleep is held.
+
+## Permissions, and exactly what the installer changes
+
+| What | Why | Where |
+|---|---|---|
+| Your password, **once** | Adds a sudoers rule allowing exactly `/usr/bin/pmset -a disablesleep 0` and `… 1`, nothing else. Sudo matches the arguments literally, so the rule can't be used for anything else. | `/etc/sudoers.d/lid-agents` |
+| "Allow notifications" prompt | Notifications when you switch, and when it pauses itself | System Settings → Notifications → Lid Agents |
+| Nothing else | The hotkey uses `RegisterEventHotKey`, which needs **no** Accessibility or Input Monitoring permission. | — |
+
+Files: `~/Applications/LidAgents.app`, the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. The app is ad-hoc signed and built from this repo by GitHub Actions. Installing with `curl` doesn't mark it as downloaded, so Gatekeeper doesn't block it.
+
+## Settings
+
+| Setting | Default | How to change |
+|---|---|---|
+| Hotkey | `ctrl+opt+cmd+a` | `defaults write io.github.liam-machine.lid-agents Hotkey "ctrl+opt+cmd+l"` (or `none`), then quit and reopen Lid Agents |
+| Agents watched | `claude codex gemini aider opencode amp goose cursor-agent droid` | `AGENTS_NAMES` |
+| Idle minutes before pausing | 3 | `AGENTS_IDLE_MINUTES` |
+| CPU % that counts as busy | 5 | `AGENTS_CPU` |
+| Hard cap (hours) | 8 | `AGENTS_HOURS`, or `agents keep 4h` |
+| Battery floor | 15% | `AGENTS_MIN_BATTERY` |
+
+The `AGENTS_*` variables apply to the `agents` command in your shell. The menu bar app uses the defaults.
+
+## Safety
+
+- **Never put the Mac in a bag while the cup is full.** With the lid shut it can't get rid of heat. Lid Agents pauses when your agents finish, but a long task can still run for hours.
+- Plug in for long runs, and run agents in `tmux` or a terminal that survives disconnects.
+- Your lock screen still works: a closed, awake Mac is locked as usual.
+
+## Uninstall
+
+```bash
+agents uninstall
+```
+
+This switches lid-close sleep back on and removes the app, the command, the login item, the sudoers rule (asking for your password) and the log.
+
+## Troubleshooting
+
+- **No cup in the menu bar.** Run `open ~/Applications/LidAgents.app`. If your menu bar is full, macOS hides extra icons; menu bar managers like Ice or Bartender can show it.
+- **The hotkey does nothing.** Another app may have claimed the same combination. Pick a different one (see Settings).
+- **"Setup incomplete".** Run `agents install`.
+- **Want to see what happened while the lid was closed?** Run `cat ~/.cache/lid-agents/lid-agents.log`.
+
+## Building from source
+
+```bash
+git clone https://github.com/liam-machine/lid-agents && cd lid-agents
+scripts/build.sh      # universal build/LidAgents.app + dist/lid-agents.tar.gz
+./install.sh          # installs the local build
+```
+
+To release, push a `v*` tag. GitHub Actions builds the app and publishes the release using the notes in `CHANGELOG.md`.
+
+## Credits
+
+The `pmset disablesleep` approach and the narrow sudoers rule follow [Sleepless](https://github.com/Aboudjem/Sleepless). Lid Agents adds the agent awareness, so the Mac only stays awake while there's work being done.

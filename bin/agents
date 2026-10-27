@@ -1,0 +1,260 @@
+#!/bin/bash
+# agents — choose what happens to your AI agents when you close the MacBook lid.
+#
+#   agents keep [hours]           closing the lid keeps agents running (screen off) while
+#                                 one is busy; pauses again once they have all gone idle
+#                                 (hours = hard cap, default 8, 0 = no cap)
+#   agents keep --always [hours]  keep running whether or not an agent is busy (default 3h)
+#   agents pause                  closing the lid sleeps the Mac and agents pause (normal)
+#   agents toggle                 switch between keep and pause
+#   agents                        status
+#   agents busy                   which agent processes count as busy right now
+#   agents install                one-time: passwordless sudo for exactly two pmset commands
+#   agents uninstall              remove everything Lid Agents installed
+#   agents version
+#
+# Mechanism: `pmset -a disablesleep 1` sets the kernel SleepDisabled flag, which also
+# blocks lid-close sleep (caffeinate and power assertions cannot). The lid sensor still
+# turns the built-in display off. A background guard reverts it when the agents go idle,
+# the cap expires or the battery reaches the floor, and if the lid is shut then, sleeps the Mac.
+#
+# "Busy" = an agent CLI that has a caffeinate child (Claude Code holds `caffeinate -i -t 300`
+# only while working) or is using >= AGENTS_CPU % CPU. An open-but-idle session is not busy.
+
+set -u
+
+AGENTS_VERSION="dev"
+BUNDLE_ID="io.github.liam-machine.lid-agents"
+
+STATE_DIR="$HOME/.cache/lid-agents"
+GUARD_PID="$STATE_DIR/guard.pid"
+LOG="$STATE_DIR/lid-agents.log"
+SUDOERS_FILE="/etc/sudoers.d/lid-agents"
+LAUNCH_AGENT="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
+LINK="$HOME/.local/bin/agents"
+
+MIN_BATTERY="${AGENTS_MIN_BATTERY:-15}"
+AGENT_NAMES="${AGENTS_NAMES:-claude codex gemini aider opencode amp goose cursor-agent droid}"
+CPU_THRESHOLD="${AGENTS_CPU:-5}"
+IDLE_MINUTES="${AGENTS_IDLE_MINUTES:-3}"
+DEFAULT_HOURS="${AGENTS_HOURS:-8}"
+
+KEEP_TEXT="Lid closed → agents keep running"
+PAUSE_TEXT="Lid closed → Mac sleeps, agents pause"
+
+# The app bundle this script ships in (empty when run from a source checkout)
+SELF="$0"
+while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
+APP_BUNDLE="${SELF%/Contents/Resources/agents}"
+[ "$APP_BUNDLE" = "$SELF" ] && APP_BUNDLE=""
+
+mkdir -p "$STATE_DIR"
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+
+keeping() {
+  # pmset only prints SleepDisabled when it is set
+  [ "$(pmset -g | awk '/SleepDisabled/ {print $2}')" = "1" ]
+}
+
+# -l only lists (never runs); -k ignores cached credentials so a recent sudo can't fake it
+has_sudo_rule() { sudo -k -n -l /usr/bin/pmset -a disablesleep 0 >/dev/null 2>&1; }
+
+set_flag() { sudo -n /usr/bin/pmset -a disablesleep "$1"; }
+
+battery_line() { pmset -g batt; }
+on_battery() { battery_line | grep -q "'Battery Power'"; }
+battery_pct() { battery_line | grep -Eo '[0-9]+%' | head -1 | tr -d '%'; }
+
+lid_closed() { ioreg -r -k AppleClamshellState -d 1 | grep -q '"AppleClamshellState" = Yes'; }
+
+guard_running() { [ -f "$GUARD_PID" ] && kill -0 "$(cat "$GUARD_PID")" 2>/dev/null; }
+
+# Prints "pid name why" for each busy agent. Names match the executable's basename exactly,
+# so the Claude desktop app ("Claude") and its helpers never count.
+busy_agents() {
+  ps -axo pid=,ppid=,pcpu=,comm= | awk -v names="$AGENT_NAMES" -v thr="$CPU_THRESHOLD" '
+    BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    {
+      pid = $1; ppid[pid] = $2; cpu[pid] = $3
+      comm = $4; for (i = 5; i <= NF; i++) comm = comm " " $i
+      sub(/.*\//, "", comm); name[pid] = comm
+      if (comm in want) agent[pid] = 1
+    }
+    END {
+      for (p in name) if (name[p] == "caffeinate" && (ppid[p] in agent)) why[ppid[p]] = "caffeinate"
+      for (p in agent) if (!(p in why) && cpu[p] + 0 >= thr) why[p] = "cpu " cpu[p] "%"
+      for (p in why) print p, name[p], why[p]
+    }'
+}
+
+busy_count() { busy_agents | wc -l | tr -d ' '; }
+
+need_rule() {
+  has_sudo_rule && return 0
+  echo "agents: setup is incomplete. Run:  agents install" >&2
+  exit 1
+}
+
+stop_guard() {
+  if [ -f "$GUARD_PID" ]; then
+    kill "$(cat "$GUARD_PID")" 2>/dev/null
+    rm -f "$GUARD_PID"
+  fi
+}
+
+start_guard() {
+  local mode="$1" hours="$2"
+  local deadline=0
+  if [ "$hours" != "0" ]; then
+    deadline=$(( $(date +%s) + $(awk "BEGIN {printf \"%d\", $hours * 3600}") ))
+  fi
+  (
+    trap 'exit 0' TERM
+    idle=0
+    while sleep 60; do
+      keeping || exit 0                             # paused elsewhere
+      reason=""
+      if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
+        reason="cap (${hours}h) reached"
+      elif on_battery && [ "$(battery_pct)" -le "$MIN_BATTERY" ]; then
+        reason="battery at $(battery_pct)% (floor ${MIN_BATTERY}%)"
+      elif [ "$mode" = "busy" ]; then
+        if [ -n "$(busy_agents)" ]; then idle=0; else idle=$((idle + 1)); fi
+        [ "$idle" -ge "$IDLE_MINUTES" ] && reason="no agent busy for ${IDLE_MINUTES} min"
+      fi
+      if [ -n "$reason" ]; then
+        if set_flag 0; then
+          log "auto-pause: $reason"
+          # the lid-close event already happened, so nothing else would sleep the Mac now
+          if lid_closed; then log "lid closed: sleeping now"; pmset sleepnow >/dev/null; fi
+        fi
+        rm -f "$GUARD_PID"
+        exit 0
+      fi
+    done
+  ) >/dev/null 2>&1 &
+  echo $! > "$GUARD_PID"
+  disown
+}
+
+cmd_keep() {
+  local mode="busy" hours=""
+  if [ "${1:-}" = "--always" ]; then mode="always"; shift; fi
+  hours="${1:-}"; hours="${hours%h}"
+  if [ -z "$hours" ]; then
+    if [ "$mode" = "always" ]; then hours=3; else hours="$DEFAULT_HOURS"; fi
+  fi
+  case "$hours" in ''|*[!0-9.]*) echo "agents: hours must be a number, got '$1'" >&2; exit 1 ;; esac
+
+  need_rule
+  set_flag 1 || exit 1
+  stop_guard
+  start_guard "$mode" "$hours"
+  log "keep (mode=$mode, cap=${hours}h, floor=${MIN_BATTERY}%)"
+
+  local cap="cap ${hours}h"; [ "$hours" = "0" ] && cap="no cap"
+  local busy; busy="$(busy_count)"
+  echo "$KEEP_TEXT"
+  if [ "$mode" = "always" ]; then
+    echo "  …whether or not they're busy ($cap, battery floor ${MIN_BATTERY}%)."
+  elif [ "$busy" = "0" ]; then
+    echo "  …but none is busy right now: pauses again in ~${IDLE_MINUTES} min unless one starts."
+  else
+    echo "  …while they're busy: $busy now ($cap, battery floor ${MIN_BATTERY}%). Close the lid whenever."
+  fi
+  if on_battery; then echo "  On battery ($(battery_pct)%): keep it out of a bag, it can't vent with the lid shut."; fi
+}
+
+cmd_pause() {
+  need_rule
+  stop_guard
+  set_flag 0 || exit 1
+  log "pause"
+  echo "$PAUSE_TEXT"
+}
+
+cmd_status() {
+  if keeping; then
+    echo "$KEEP_TEXT"
+    local how; how="$(grep ' keep (' "$LOG" 2>/dev/null | tail -1 | sed 's/.* keep (//; s/)$//')"
+    if guard_running; then
+      echo "  guard:   watching ($how)"
+    else
+      echo "  guard:   NOT running, so nothing will pause it automatically (agents pause)"
+    fi
+  else
+    echo "$PAUSE_TEXT"
+  fi
+  echo "  busy:    $(busy_count) agent(s)"
+  echo "  battery: $(battery_pct)% $(on_battery && echo '(on battery)' || echo '(on AC)') · lid $(lid_closed && echo closed || echo open)"
+  if ! has_sudo_rule; then echo "  setup:   incomplete (agents install)"; fi
+  if [ -f "$LOG" ]; then echo "  last:    $(tail -1 "$LOG")"; fi
+}
+
+# One machine-readable line for the menu bar app:
+#   <keep|pause> <busy> <guard 0|1> <battery%> <ac|battery> <open|closed> <setup ok|missing> <idle minutes>
+cmd_state() {
+  printf '%s %s %s %s %s %s %s %s\n' \
+    "$(keeping && echo keep || echo pause)" "$(busy_count)" "$(guard_running && echo 1 || echo 0)" \
+    "$(battery_pct)" "$(on_battery && echo battery || echo ac)" "$(lid_closed && echo closed || echo open)" \
+    "$(has_sudo_rule && echo ok || echo missing)" "$IDLE_MINUTES"
+}
+
+cmd_busy() {
+  local out; out="$(busy_agents)"
+  if [ -z "$out" ]; then echo "No busy agents (watching: $AGENT_NAMES)"; return 0; fi
+  echo "$out" | while read -r pid name why; do
+    printf '%-7s %-10s %-14s %s\n' "$pid" "$name" "$why" "$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+  done
+}
+
+# Runs a shell command as root: sudo when there is a terminal to ask in, the macOS admin
+# dialog otherwise (GUI-launched shells and Claude Code's `!` prompt have no TTY).
+as_root() {
+  if (: </dev/tty) 2>/dev/null; then
+    sudo /bin/sh -c "$1"
+  else
+    osascript -e "do shell script \"$1\" with administrator privileges" >/dev/null
+  fi
+}
+
+cmd_install() {
+  if has_sudo_rule; then echo "pmset rule already installed."; return 0; fi
+  local user rule tmp
+  user="$(id -un)"
+  rule="$user ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
+  tmp="$(mktemp)"
+  echo "$rule" > "$tmp"
+  if ! visudo -cf "$tmp" >/dev/null; then echo "agents: generated rule failed visudo" >&2; rm -f "$tmp"; exit 1; fi
+  echo "Installing $SUDOERS_FILE (your password, once):"
+  echo "  $rule"
+  as_root "install -m 0440 -o root -g wheel '$tmp' '$SUDOERS_FILE'" || { rm -f "$tmp"; exit 1; }
+  rm -f "$tmp"
+  has_sudo_rule && echo "Done." || { echo "agents: the rule did not take effect" >&2; exit 1; }
+}
+
+cmd_uninstall() {
+  if keeping && has_sudo_rule; then cmd_pause >/dev/null; fi
+  stop_guard
+  pkill -x LidAgents 2>/dev/null
+  rm -f "$LAUNCH_AGENT"
+  if [ -f "$SUDOERS_FILE" ]; then as_root "rm -f '$SUDOERS_FILE'" && echo "Removed $SUDOERS_FILE"; fi
+  if [ -L "$LINK" ]; then rm -f "$LINK"; fi
+  if [ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ]; then rm -rf "$APP_BUNDLE" && echo "Removed $APP_BUNDLE"; fi
+  rm -rf "$STATE_DIR"
+  echo "Lid Agents is uninstalled. Closing the lid sleeps the Mac as normal."
+}
+
+case "${1:-status}" in
+  keep|on)    shift; cmd_keep "$@" ;;
+  pause|off)  cmd_pause ;;
+  toggle)     if keeping; then cmd_pause; else shift; cmd_keep "$@"; fi ;;
+  status)     cmd_status ;;
+  state)      cmd_state ;;
+  busy)       cmd_busy ;;
+  install)    cmd_install ;;
+  uninstall)  cmd_uninstall ;;
+  version|--version|-v) echo "lid-agents $AGENTS_VERSION" ;;
+  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || exit 1 ;;
+esac
