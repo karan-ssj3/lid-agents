@@ -49,7 +49,11 @@ fi
 
 # 2. Install the app (quit a running copy first so the upgrade takes)
 step "Installing $APP"
-pkill -x LidAgents 2>/dev/null && sleep 1 || true
+# -a: when the app's own Update item started this installer, the app is our ancestor,
+# and macOS pkill skips ancestors by default. `open` below would then just reactivate it.
+pkill -a -x LidAgents 2>/dev/null || true
+for _ in $(seq 50); do pgrep -x LidAgents >/dev/null || break; sleep 0.1; done
+pkill -9 -a -x LidAgents 2>/dev/null || true
 mkdir -p "$HOME/Applications"
 rm -rf "$APP"
 ditto "$src" "$APP"
