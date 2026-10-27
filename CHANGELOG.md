@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.4
+
+- **Choose your hotkey from the menu.** The cup → **Hotkey** offers ⌃⌥⌘A (default), ⌃⌥⌘L, ⌃⌥⌘K, ⌃⇧⌘Space or None, plus **Record New Hotkey…**, a small window where you press the keys you want. The change applies immediately, with no restart. If another app already uses the combination, you're told and the old hotkey stays.
+
 ## 1.0.3
 
 - **Fixed:** clicking **Update to x.y.z** installed the new version but left the old one running, still showing "Updating…". The installer now quits the running app, even when that app is what started it, before replacing it.

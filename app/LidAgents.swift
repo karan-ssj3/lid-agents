@@ -126,7 +126,8 @@ enum Updater {
 
 // MARK: - Global hotkey (Carbon RegisterEventHotKey needs no Accessibility permission)
 
-struct Hotkey {
+struct Hotkey: Equatable {
+    let spec: String            // normalised, as stored in the Hotkey default
     let keyCode: UInt32
     let modifiers: UInt32
     let symbols: String
@@ -134,6 +135,7 @@ struct Hotkey {
     let menuModifiers: NSEvent.ModifierFlags
 
     static let fallback = "ctrl+opt+cmd+a"
+    static let presets = ["ctrl+opt+cmd+a", "ctrl+opt+cmd+l", "ctrl+opt+cmd+k", "ctrl+shift+cmd+space"]
 
     static let keys: [String: Int] = [
         "a": kVK_ANSI_A, "b": kVK_ANSI_B, "c": kVK_ANSI_C, "d": kVK_ANSI_D, "e": kVK_ANSI_E, "f": kVK_ANSI_F,
@@ -160,14 +162,30 @@ struct Hotkey {
             }
         }
         guard let key, let code = keys[key] else { return nil }
+        // A global hotkey needs ⌃, ⌥ or ⌘; a bare letter (or ⇧+letter) would swallow typing
+        guard !flags.isDisjoint(with: [.control, .option, .command]) else { return nil }
         var symbols = ""
-        if flags.contains(.control) { symbols += "⌃" }
-        if flags.contains(.option) { symbols += "⌥" }
-        if flags.contains(.shift) { symbols += "⇧" }
-        if flags.contains(.command) { symbols += "⌘" }
+        var normalised: [String] = []
+        if flags.contains(.control) { symbols += "⌃"; normalised.append("ctrl") }
+        if flags.contains(.option) { symbols += "⌥"; normalised.append("opt") }
+        if flags.contains(.shift) { symbols += "⇧"; normalised.append("shift") }
+        if flags.contains(.command) { symbols += "⌘"; normalised.append("cmd") }
         symbols += key == "space" ? "Space" : key.uppercased()
-        return Hotkey(keyCode: UInt32(code), modifiers: mods, symbols: symbols,
-                      menuKey: key == "space" ? " " : key, menuModifiers: flags)
+        normalised.append(key)
+        return Hotkey(spec: normalised.joined(separator: "+"), keyCode: UInt32(code), modifiers: mods,
+                      symbols: symbols, menuKey: key == "space" ? " " : key, menuModifiers: flags)
+    }
+
+    /// The hotkey a key press in the recorder describes, or nil if it isn't usable as one.
+    static func from(_ event: NSEvent) -> Hotkey? {
+        guard let key = keys.first(where: { $0.value == Int(event.keyCode) })?.key else { return nil }
+        let flags = event.modifierFlags
+        var parts: [String] = []
+        if flags.contains(.control) { parts.append("ctrl") }
+        if flags.contains(.option) { parts.append("opt") }
+        if flags.contains(.shift) { parts.append("shift") }
+        if flags.contains(.command) { parts.append("cmd") }
+        return parse((parts + [key]).joined(separator: "+"))
     }
 
     static var configured: Hotkey? {
@@ -177,16 +195,114 @@ struct Hotkey {
 }
 
 var hotkeyHandler: (() -> Void)?
+var hotkeyRef: EventHotKeyRef?
+var hotkeyHandlerInstalled = false
 
-func registerHotkey(_ hotkey: Hotkey) {
-    var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-    InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
-        DispatchQueue.main.async { hotkeyHandler?() }
-        return noErr
-    }, 1, &spec, nil, nil)
-    var ref: EventHotKeyRef?
+/// Makes `hotkey` the global hotkey (nil clears it). False when macOS refuses the combination.
+@discardableResult
+func setGlobalHotkey(_ hotkey: Hotkey?) -> Bool {
+    if !hotkeyHandlerInstalled {
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { hotkeyHandler?() }
+            return noErr
+        }, 1, &spec, nil, nil)
+        hotkeyHandlerInstalled = true
+    }
+    if let ref = hotkeyRef {
+        UnregisterEventHotKey(ref)
+        hotkeyRef = nil
+    }
+    guard let hotkey else { return true }
     let id = EventHotKeyID(signature: OSType(0x4C414754), id: 1)   // 'LAGT'
-    RegisterEventHotKey(hotkey.keyCode, hotkey.modifiers, id, GetApplicationEventTarget(), 0, &ref)
+    return RegisterEventHotKey(hotkey.keyCode, hotkey.modifiers, id, GetApplicationEventTarget(), 0, &hotkeyRef) == noErr
+}
+
+// MARK: - Hotkey recorder window
+
+/// Captures the next key press, including ⌘ combinations that would otherwise go to menus.
+final class RecorderView: NSView {
+    var onKey: ((NSEvent) -> Void)?
+    override var acceptsFirstResponder: Bool { true }
+    override func keyDown(with event: NSEvent) { onKey?(event) }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard event.type == .keyDown else { return false }
+        onKey?(event)
+        return true
+    }
+}
+
+final class HotkeyRecorder: NSObject, NSWindowDelegate {
+    let window = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 170),
+                         styleMask: [.titled, .closable], backing: .buffered, defer: false)
+    let keys = NSTextField(labelWithString: "")
+    let hint = NSTextField(labelWithString: "")
+    var onFinish: ((Hotkey?) -> Void)?      // nil when cancelled
+    var finished = false
+
+    init(current: Hotkey?) {
+        super.init()
+        window.title = "Lid Agents Hotkey"
+        window.delegate = self
+        window.isReleasedWhenClosed = false
+        window.level = .floating
+
+        let view = RecorderView(frame: window.contentRect(forFrameRect: window.frame))
+        view.onKey = { [weak self] in self?.handle($0) }
+
+        let prompt = NSTextField(labelWithString: "Press the keys you want to use")
+        prompt.font = .systemFont(ofSize: 13, weight: .semibold)
+        keys.stringValue = current?.symbols ?? "—"
+        keys.font = .systemFont(ofSize: 30, weight: .medium)
+        keys.alignment = .center
+        hint.stringValue = "Use ⌃, ⌥ or ⌘ with a letter, number or Space. Esc cancels."
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        let cancel = NSButton(title: "Cancel", target: self, action: #selector(cancel))
+
+        let stack = NSStackView(views: [prompt, keys, hint, cancel])
+        stack.orientation = .vertical
+        stack.alignment = .centerX
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
+        ])
+        window.contentView = view
+    }
+
+    func show() {
+        NSApp.activate(ignoringOtherApps: true)
+        window.center()
+        window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(window.contentView)
+    }
+
+    func handle(_ event: NSEvent) {
+        if event.keyCode == UInt16(kVK_Escape) { cancel(); return }
+        guard let hotkey = Hotkey.from(event) else {
+            hint.stringValue = "That needs ⌃, ⌥ or ⌘ as well. Try again, or press Esc."
+            hint.textColor = .systemOrange
+            return
+        }
+        keys.stringValue = hotkey.symbols
+        hint.stringValue = "Saved."
+        hint.textColor = .secondaryLabelColor
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self.finish(hotkey) }
+    }
+
+    @objc func cancel() { finish(nil) }
+
+    func windowWillClose(_ notification: Notification) { finish(nil) }
+
+    func finish(_ hotkey: Hotkey?) {
+        guard !finished else { return }
+        finished = true
+        window.close()
+        onFinish?(hotkey)
+    }
 }
 
 // MARK: - App
@@ -194,7 +310,8 @@ func registerHotkey(_ hotkey: Hotkey) {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
-    let hotkey = Hotkey.configured
+    var hotkey = Hotkey.configured
+    var recorder: HotkeyRecorder?
     var state = AgentState()
     var acting = false          // a change this app made, so it isn't reported as an auto-pause
     var timer: Timer?
@@ -207,10 +324,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         statusItem.menu = menu
         statusItem.button?.imagePosition = .imageLeading
 
-        if let hotkey {
-            hotkeyHandler = { [weak self] in self?.toggle() }
-            registerHotkey(hotkey)
-        }
+        hotkeyHandler = { [weak self] in self?.toggle() }
+        setGlobalHotkey(hotkey)
 
         let center = UNUserNotificationCenter.current()
         center.delegate = self
@@ -271,6 +386,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     @objc func manualUpdateCheck() { checkForUpdates(manual: true) }
+
+    // MARK: Hotkey
+
+    /// Switches to `new` (nil = no hotkey), keeping the old one if macOS refuses it.
+    func useHotkey(_ new: Hotkey?) {
+        guard setGlobalHotkey(new) else {
+            setGlobalHotkey(hotkey)
+            notify("\(new?.symbols ?? "That hotkey") isn't available", "Another app is using it. Pick a different one.")
+            return
+        }
+        hotkey = new
+        UserDefaults.standard.set(new?.spec ?? "none", forKey: "Hotkey")
+        notify(new.map { "Hotkey: \($0.symbols)" } ?? "Hotkey off",
+               new.map { "Press \($0.symbols) anywhere to switch." } ?? "Use the cup in the menu bar to switch.")
+    }
+
+    @objc func choosePresetHotkey(_ sender: NSMenuItem) {
+        useHotkey((sender.representedObject as? String).flatMap(Hotkey.parse))
+    }
+
+    @objc func recordHotkey() {
+        recorder?.finish(nil)
+        setGlobalHotkey(nil)                 // so pressing the current one records it instead of toggling
+        let recorder = HotkeyRecorder(current: hotkey)
+        recorder.onFinish = { [weak self] picked in
+            guard let self else { return }
+            self.recorder = nil
+            if let picked { self.useHotkey(picked) } else { setGlobalHotkey(self.hotkey) }
+        }
+        self.recorder = recorder
+        recorder.show()
+    }
+
+    func hotkeyMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "Hotkey: \(hotkey?.symbols ?? "None")", action: nil, keyEquivalent: "")
+        item.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)
+        let submenu = NSMenu()
+        var specs = Hotkey.presets
+        if let current = hotkey?.spec, !specs.contains(current) { specs.insert(current, at: 0) }
+        for spec in specs {
+            guard let preset = Hotkey.parse(spec) else { continue }
+            let choice = NSMenuItem(title: preset.symbols + (spec == Hotkey.fallback ? "  (default)" : ""),
+                                    action: #selector(choosePresetHotkey(_:)), keyEquivalent: "")
+            choice.target = self
+            choice.representedObject = spec
+            choice.state = preset == hotkey ? .on : .off
+            submenu.addItem(choice)
+        }
+        let none = NSMenuItem(title: "None", action: #selector(choosePresetHotkey(_:)), keyEquivalent: "")
+        none.target = self
+        none.representedObject = "none"
+        none.state = hotkey == nil ? .on : .off
+        submenu.addItem(none)
+        submenu.addItem(.separator())
+        let record = NSMenuItem(title: "Record New Hotkey…", action: #selector(recordHotkey), keyEquivalent: "")
+        record.target = self
+        submenu.addItem(record)
+        item.submenu = submenu
+        return item
+    }
 
     @objc func installUpdate() {
         guard let version = availableUpdate, !updating else { return }
@@ -406,6 +581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         busyItem.submenu = busyMenu
         menu.addItem(busyItem)
 
+        menu.addItem(hotkeyMenuItem())
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = FileManager.default.fileExists(atPath: launchAgentPath) ? .on : .off

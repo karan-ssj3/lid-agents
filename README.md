@@ -60,7 +60,7 @@ Files: `~/Applications/LidAgents.app`, the `agents` link in `~/.local/bin`, a lo
 
 | Setting | Default | How to change |
 |---|---|---|
-| Hotkey | `ctrl+opt+cmd+a` | `defaults write io.github.liam-machine.lid-agents Hotkey "ctrl+opt+cmd+l"` (or `none`), then quit and reopen Lid Agents |
+| Hotkey | ⌃⌥⌘A | The cup → **Hotkey** → pick a preset, **None**, or **Record New Hotkey…** and press the keys you want. It applies immediately. It needs ⌃, ⌥ or ⌘ with a letter, number or Space. |
 | Agents watched | `claude codex gemini aider opencode amp goose cursor-agent droid` | `AGENTS_NAMES` |
 | Idle minutes before pausing | 3 | `AGENTS_IDLE_MINUTES` |
 | CPU % that counts as busy | 5 | `AGENTS_CPU` |
