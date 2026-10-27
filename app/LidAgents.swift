@@ -73,6 +73,57 @@ enum Agents {
     }
 }
 
+// MARK: - Updates (notify only; installing is always the user's click)
+
+enum Updater {
+    static let repo = "liam-machine/lid-agents"
+    static let logPath = stateDir + "/update.log"
+
+    static var current: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
+    }
+
+    static func isVersion(_ s: String) -> Bool {
+        s.range(of: #"^[0-9]+(\.[0-9]+){1,3}$"#, options: .regularExpression) != nil
+    }
+
+    static func isNewer(_ a: String, than b: String) -> Bool {
+        let x = a.split(separator: ".").map { Int($0) ?? 0 }
+        let y = b.split(separator: ".").map { Int($0) ?? 0 }
+        for i in 0..<max(x.count, y.count) {
+            let p = i < x.count ? x[i] : 0, q = i < y.count ? y[i] : 0
+            if p != q { return p > q }
+        }
+        return false
+    }
+
+    /// The latest release's version, from GitHub's public API (one anonymous request).
+    static func latest(_ done: @escaping (String?) -> Void) {
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.timeoutInterval = 15
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+            var tag = json?["tag_name"] as? String
+            if tag?.hasPrefix("v") == true { tag = String(tag!.dropFirst()) }
+            done(tag.flatMap { isVersion($0) ? $0 : nil })
+        }.resume()
+    }
+
+    /// Runs that release's installer, which quits this app, replaces it and reopens it.
+    static func install(_ version: String) {
+        guard isVersion(version) else { return }
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        process.arguments = ["-c", """
+            curl -fsSL https://github.com/\(repo)/releases/download/v\(version)/install.sh \
+              | LID_AGENTS_VERSION=\(version) bash >> "\(logPath)" 2>&1
+            """]
+        try? process.run()
+    }
+}
+
 // MARK: - Global hotkey (Carbon RegisterEventHotKey needs no Accessibility permission)
 
 struct Hotkey {
@@ -147,6 +198,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var state = AgentState()
     var acting = false          // a change this app made, so it isn't reported as an auto-pause
     var timer: Timer?
+    var updateTimer: Timer?
+    var availableUpdate: String?
+    var updating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         menu.delegate = self
@@ -161,14 +215,73 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert]) { [weak self] granted, _ in
-            guard granted, !UserDefaults.standard.bool(forKey: "Welcomed") else { return }
-            UserDefaults.standard.set(true, forKey: "Welcomed")
-            let how = self?.hotkey.map { "Press \($0.symbols) or click" } ?? "Click"
-            self?.notify("Lid Agents is ready", "\(how) the cup in the menu bar to keep agents running with the lid closed.")
+            guard granted else { return }
+            let defaults = UserDefaults.standard
+            let lastRun = defaults.string(forKey: "LastRunVersion")
+            defaults.set(Updater.current, forKey: "LastRunVersion")
+            if !defaults.bool(forKey: "Welcomed") {
+                defaults.set(true, forKey: "Welcomed")
+                let how = self?.hotkey.map { "Press \($0.symbols) or click" } ?? "Click"
+                self?.notify("Lid Agents is ready", "\(how) the cup in the menu bar to keep agents running with the lid closed.")
+            } else if let lastRun, Updater.isNewer(Updater.current, than: lastRun) {
+                self?.notify("Lid Agents updated to \(Updater.current)",
+                             "See what's new at github.com/\(Updater.repo)/releases.")
+            }
         }
 
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
+
+        // Check at launch, then whenever a day has passed since the last check
+        checkForUpdates(manual: false)
+        updateTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
+            let last = UserDefaults.standard.double(forKey: "LastUpdateCheck")
+            if Date().timeIntervalSince1970 - last > 86_400 { self?.checkForUpdates(manual: false) }
+        }
+    }
+
+    // MARK: Updates
+
+    var updatesEnabled: Bool { UserDefaults.standard.object(forKey: "CheckForUpdates") as? Bool ?? true }
+
+    func checkForUpdates(manual: Bool) {
+        guard manual || updatesEnabled else { return }
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "LastUpdateCheck")
+        Updater.latest { [weak self] latest in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard let latest else {
+                    if manual { self.notify("Couldn't check for updates", "GitHub didn't answer. Try again later.") }
+                    return
+                }
+                guard Updater.isNewer(latest, than: Updater.current) else {
+                    self.availableUpdate = nil
+                    if manual { self.notify("Lid Agents is up to date", "You have the latest version, \(Updater.current).") }
+                    return
+                }
+                self.availableUpdate = latest
+                // Tell the user once per version; the menu item stays until they update
+                if manual || UserDefaults.standard.string(forKey: "NotifiedUpdate") != latest {
+                    UserDefaults.standard.set(latest, forKey: "NotifiedUpdate")
+                    self.notify("Lid Agents \(latest) is available",
+                                "Click the cup in the menu bar, then Update to \(latest).")
+                }
+            }
+        }
+    }
+
+    @objc func manualUpdateCheck() { checkForUpdates(manual: true) }
+
+    @objc func installUpdate() {
+        guard let version = availableUpdate, !updating else { return }
+        updating = true
+        notify("Updating Lid Agents to \(version)…", "It will reopen by itself in a few seconds.")
+        Updater.install(version)
+        // On success the installer quits this app; still being here means it failed
+        DispatchQueue.main.asyncAfter(deadline: .now() + 90) { [weak self] in
+            self?.updating = false
+            self?.notify("Lid Agents couldn't update", "Details are in ~/.cache/lid-agents/update.log.")
+        }
     }
 
     // Show banners even while the menu is open (the app counts as frontmost then)
@@ -258,6 +371,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             menu.addItem(item)
         }
 
+        if let version = availableUpdate {
+            action(updating ? "Updating to \(version)…" : "Update to \(version)", #selector(installUpdate),
+                   symbol: "arrow.down.circle.fill")
+            menu.addItem(.separator())
+        }
+
         if state.keeping {
             info("Lid closed → agents keep running", symbol: "cup.and.saucer.fill")
         } else {
@@ -294,6 +413,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         let logItem = NSMenuItem(title: "Open Log", action: #selector(openLog), keyEquivalent: "")
         logItem.target = self
         menu.addItem(logItem)
+        let checkItem = NSMenuItem(title: "Check for Updates…", action: #selector(manualUpdateCheck), keyEquivalent: "")
+        checkItem.target = self
+        menu.addItem(checkItem)
+        info("Version \(Updater.current)")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit Lid Agents", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
     }

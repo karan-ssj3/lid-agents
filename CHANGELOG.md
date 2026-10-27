@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.2
+
+- **Update notifications.** Once a day the app checks for a newer release. If there is one, you get one notification, and **Update to x.y.z** appears in the cup's menu; one click installs it and reopens the app. It never updates without your click. **Check for Updates…** is also in the menu, and `agents update` does the same in a terminal. Turn the check off with `defaults write io.github.liam-machine.lid-agents CheckForUpdates -bool false`.
+- The menu shows the installed version.
+- Every merge to `main` now ships as the next patch release automatically.
+
 ## 1.0.1
 
 - Holding the hotkey a little too long no longer switches twice: presses are ignored while a switch is still being applied.

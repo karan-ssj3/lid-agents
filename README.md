@@ -30,6 +30,7 @@ agents keep --always   # even when no agent is busy (3h)
 agents pause           # normal lid-close sleep
 agents                 # status
 agents busy            # which agents count as busy, and in which folder
+agents update          # install the latest release
 ```
 
 ## Why this needs a tool
@@ -74,6 +75,13 @@ The `AGENTS_*` variables apply to the `agents` command in your shell. The menu b
 - Plug in for long runs, and run agents in `tmux` or a terminal that survives disconnects.
 - Your lock screen still works: a closed, awake Mac is locked as usual.
 
+## Updates
+
+Once a day, Lid Agents asks GitHub's public API for the latest release. That one anonymous request sends nothing about you or your Mac. When there's a newer version, you get **one notification**, and **Update to x.y.z** appears at the top of the cup's menu. Clicking it installs the update and reopens the app a few seconds later, with no password. It never updates on its own. If an agent is running with the lid closed while it updates, it keeps running.
+
+- Check now: the cup → **Check for Updates…**, or `agents update` in a terminal.
+- Turn off the daily check: `defaults write io.github.liam-machine.lid-agents CheckForUpdates -bool false`
+
 ## Uninstall
 
 ```bash
@@ -97,7 +105,11 @@ scripts/build.sh      # universal build/LidAgents.app + dist/lid-agents.tar.gz
 ./install.sh          # installs the local build
 ```
 
-To release, push a `v*` tag. GitHub Actions builds the app and publishes the release using the notes in `CHANGELOG.md`.
+**Releasing.** Every merge to `main` that changes the app is built by GitHub Actions and published as the next patch release (latest tag + 1). Installed copies offer it within a day. Pushes that only change docs don't release.
+
+- Curated release notes: add a `## x.y.z` section to `CHANGELOG.md` before merging. Without one, GitHub writes the notes from the commits.
+- Minor or major bump: set `VERSION` to e.g. `1.1.0`.
+- Re-run a release by hand: Actions → *Build and release* → *Run workflow*.
 
 ## Credits
 

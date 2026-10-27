@@ -11,6 +11,7 @@
 #   agents busy                   which agent processes count as busy right now
 #   agents install                one-time: passwordless sudo for exactly two pmset commands
 #   agents uninstall              remove everything Lid Agents installed
+#   agents update                 install the latest release
 #   agents version
 #
 # Mechanism: `pmset -a disablesleep 1` sets the kernel SleepDisabled flag, which also
@@ -234,6 +235,16 @@ cmd_install() {
   has_sudo_rule && echo "Done." || { echo "agents: the rule did not take effect" >&2; exit 1; }
 }
 
+cmd_update() {
+  local repo="liam-machine/lid-agents" latest
+  latest="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest" \
+    | sed -n 's/.*"tag_name": *"v\{0,1\}\([0-9][0-9.]*\)".*/\1/p' | head -1)"
+  if [ -z "$latest" ]; then echo "agents: couldn't reach GitHub to check for updates" >&2; exit 1; fi
+  if [ "$latest" = "$AGENTS_VERSION" ]; then echo "Lid Agents is up to date ($latest)."; return 0; fi
+  echo "Updating Lid Agents $AGENTS_VERSION → $latest"
+  curl -fsSL "https://github.com/$repo/releases/download/v$latest/install.sh" | LID_AGENTS_VERSION="$latest" bash
+}
+
 cmd_uninstall() {
   if keeping && has_sudo_rule; then cmd_pause >/dev/null; fi
   stop_guard
@@ -255,6 +266,7 @@ case "${1:-status}" in
   busy)       cmd_busy ;;
   install)    cmd_install ;;
   uninstall)  cmd_uninstall ;;
+  update)     cmd_update ;;
   version|--version|-v) echo "lid-agents $AGENTS_VERSION" ;;
-  *) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || exit 1 ;;
+  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || exit 1 ;;
 esac
