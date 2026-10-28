@@ -1,0 +1,12 @@
+# Download site for Lid Agents. Deploy with: cd site && wrangler deploy
+name = "lid-agents-site"
+main = "worker.js"
+compatibility_date = "2025-09-01"
+account_id = "0c48b1025075e124b4d401a3c926e26b"
+workers_dev = false
+routes = [{ pattern = "lid-agents.liam-is-an.ai", custom_domain = true }]
+
+[[rules]]
+type = "Data"
+globs = ["**/*.png"]
+fallthrough = true

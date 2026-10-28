@@ -4,6 +4,8 @@
 
 [![Download for macOS](https://img.shields.io/github/v/release/liam-machine/lid-agents?label=Download%20for%20macOS&logo=apple&style=for-the-badge&color=8a5a2b)](https://github.com/liam-machine/lid-agents/releases/latest/download/LidAgents.dmg)
 
+Website: **[lid-agents.liam-is-an.ai](https://lid-agents.liam-is-an.ai)**
+
 Claude Code, Codex and other terminal agents stop the moment you close the lid, because macOS sleeps. Lid Agents adds a coffee cup to your menu bar. Fill it (click, or press <kbd>⌃0</kbd>) and closing the lid turns the screen off but keeps the Mac awake **while an agent is busy**. When they've all finished, it switches itself back off and puts the closed Mac to sleep.
 
 No external display, no keyboard or mouse plugged in, no power adapter required.
