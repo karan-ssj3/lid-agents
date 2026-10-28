@@ -61,7 +61,9 @@ enum Agents {
             let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
             guard parts.count >= 3, Int(parts[0]) != nil else { return nil }
             let folder = parts.count > 4 ? parts[4...].joined(separator: " ") : ""
-            return (parts[1], folder)
+            // "needs input": stopped on a prompt, so it isn't counted as busy
+            let waiting = parts.count > 3 && parts[2] == "needs" && parts[3] == "input"
+            return (waiting ? "\(parts[1]) (needs input)" : parts[1], folder)
         }
     }
 
