@@ -789,6 +789,8 @@ cmd_uninstall() {
   fi
 }
 
+# Left unindented so a new command is a one-line change
+main() {
 case "${1:-status}" in
   keep|on)    shift; cmd_keep "$@" ;;
   pause|off)  cmd_pause ;;
@@ -806,3 +808,7 @@ case "${1:-status}" in
   version|--version|-v) echo "lid-agents $AGENTS_VERSION" ;;
   *) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || exit 1 ;;
 esac
+}
+
+# tests/run.sh sources this file for its functions, with AGENTS_SOURCED=1
+[ "${AGENTS_SOURCED:-}" = 1 ] || main "$@"
