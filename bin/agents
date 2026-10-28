@@ -247,11 +247,8 @@ agent_report() {
     }'
 }
 
-# "pid name why" per busy agent (not counting ones that need input); --cpu adds the combined CPU %
-busy_agents() {
-  if [ "${1:-}" = "--cpu" ]; then agent_report | awk '$3 " " $4 != "needs input"'
-  else agent_report | awk '$3 " " $4 != "needs input" { print $1, $2, $3, $4 }'; fi
-}
+# "pid name why" per busy agent (not counting ones that need input)
+busy_agents() { agent_report | awk '$3 " " $4 != "needs input" { print $1, $2, $3, $4 }'; }
 
 busy_count() { busy_agents | wc -l | tr -d ' '; }
 
@@ -268,6 +265,44 @@ stop_guard() {
   fi
 }
 
+# Alerts the guard sends while keep is on (no-ops when `agents phone` is off).
+#
+# alert_waiting <report> <pids already alerted> <mode>: one alert per agent that has newly
+# stopped on a prompt, lid open or closed (you may have walked away either way); prints the
+# pids alerted so far, for the next call.
+alert_waiting() {
+  local report="$1" before=" $2 " mode="$3" now="" pid name kind what folder busy msg
+  [ -n "$(phone_url)" ] || return 0
+  busy="$(printf '%s\n' "$report" | awk 'NF && $3 " " $4 != "needs input"' | wc -l | tr -d ' ')"
+  while read -r pid name _; do
+    [ -n "$pid" ] || continue
+    now="$now $pid"
+    case "$before" in *" $pid "*) continue ;; esac
+    kind="$(awk 'NR == 1 { print $2 }' "$WAITING_DIR/$pid" 2>/dev/null)"
+    case "$kind" in permission) what="a permission prompt" ;; question) what="a question" ;; *) what="you" ;; esac
+    folder="$(agent_folder "$pid")"; folder="${folder##*/}"
+    msg="$name in ${folder:-its folder} is waiting on $what."
+    if [ "$mode" = "busy" ] && [ "$busy" = "0" ] && lid_closed; then
+      msg="$msg The lid is closed and nothing else is busy, so the Mac sleeps in about $(wait_minutes) min unless it's answered."
+    fi
+    phone_send "Agent needs you" "$msg" high "raising_hand" || true
+  done <<< "$(printf '%s\n' "$report" | awk '$3 " " $4 == "needs input"')"
+  echo "$now"
+}
+
+# pause_alert <reason> <report>: the guard has switched keep off
+pause_alert() {
+  local title msg waiting
+  [ -n "$(phone_url)" ] || return 0
+  case "$1" in "no agent busy"*) title="Agents finished" ;; *) title="Lid Agents paused" ;; esac
+  msg="Paused: $1."
+  waiting="$(printf '%s\n' "$2" | awk '$3 " " $4 == "needs input" { print $2 }' | sort | uniq -c |
+    awk '{ printf "%s%s%s", sep, $2, ($1 > 1 ? " x" $1 : ""); sep = ", " }')"
+  if [ -n "$waiting" ]; then msg="$msg Still waiting on you: $waiting."; fi
+  if lid_closed; then msg="$msg The Mac is going to sleep."; else msg="$msg The lid is open, so the Mac stays on."; fi
+  phone_send "$title" "$msg" default "zzz" || true
+}
+
 start_guard() {
   local mode="$1" hours="$2"
   local deadline=0
@@ -279,15 +314,19 @@ start_guard() {
     idle=0
     quiet=0
     waited=0
+    alerted=""
     while sleep 60; do
       keeping || exit 0                             # paused elsewhere
       reason=""
+      # One report a minute serves the busy checks and the phone alerts
+      report=""
+      if [ "$mode" = "busy" ] || [ -n "$(phone_url)" ]; then report="$(agent_report)"; fi
+      alerted="$(alert_waiting "$report" "$alerted" "$mode")"
       if [ "$deadline" -gt 0 ] && [ "$(date +%s)" -ge "$deadline" ]; then
         reason="cap (${hours}h) reached"
       elif on_battery && [ "$(battery_pct)" -le "$MIN_BATTERY" ]; then
         reason="battery at $(battery_pct)% (floor ${MIN_BATTERY}%)"
       elif [ "$mode" = "busy" ]; then
-        report="$(agent_report)"
         if lid_closed; then
           busy="$(printf '%s\n' "$report" | awk 'NF && $3 " " $4 != "needs input"')"
           waiting="$(printf '%s\n' "$report" | awk 'NF && $3 " " $4 == "needs input"')"
@@ -320,6 +359,7 @@ start_guard() {
       if [ -n "$reason" ]; then
         if set_flag 0; then
           log "auto-pause: $reason"
+          pause_alert "$reason" "$report"           # before sleeping, while the network is up
           # the lid-close event already happened, so nothing else would sleep the Mac now
           if lid_closed; then log "lid closed: sleeping now"; pmset sleepnow >/dev/null; fi
         fi
