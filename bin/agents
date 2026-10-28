@@ -11,6 +11,8 @@
 #   agents busy                   which agent processes count as busy (or need you) right now
 #   agents wait [minutes]         how long a closed Mac stays awake for an agent that needs you
 #                                 (default 3; also under the cup → When an agent needs you)
+#   agents phone [setup|URL|test|off]  phone alerts (ntfy) while keep is on: when the agents
+#                                 finish, an agent needs you, or Lid Agents pauses
 #   agents hotkey [keys|none]     show or set the hotkey, e.g. agents hotkey ctrl+opt+cmd+l
 #   agents install                one-time: passwordless sudo for exactly two pmset commands
 #   agents integrate              let Lid Agents see when Codex and OpenCode are busy, and when
@@ -50,6 +52,8 @@ OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/lid-agents.j
 WAITING_DIR="$STATE_DIR/waiting"               # <agent pid> files: "<epoch> <kind>", from hooks
 CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
 HOOK_TAG="# lid-agents-hook"                   # marks the hook entries this script owns
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/lid-agents"
+PHONE_FILE="$CONFIG_DIR/phone"                 # the ntfy URL; its topic is effectively a password
 
 MIN_BATTERY="${AGENTS_MIN_BATTERY:-15}"
 AGENT_NAMES="${AGENTS_NAMES:-claude codex gemini aider opencode amp goose cursor-agent droid}"
@@ -381,6 +385,7 @@ cmd_status() {
   echo "  waiting: $(printf '%s\n' "$report" | awk 'NF && $3 " " $4 == "needs input"' | wc -l | tr -d ' ') need you · a closed Mac stays awake $(wait_minutes) min for an answer (agents wait)"
   echo "  battery: $(battery_pct)% $(on_battery && echo '(on battery)' || echo '(on AC)') · lid $(lid_closed && echo closed || echo open)"
   echo "  hotkey:  $(current_hotkey)"
+  if [ -n "$(phone_url)" ]; then echo "  phone:   alerts on, through $(phone_where)"; fi
   if ! pgrep -x LidAgents >/dev/null; then
     echo "  app:     not running (open Lid Agents from Applications or Spotlight)"
   fi
@@ -503,6 +508,77 @@ cmd_update() {
   if [ "$latest" = "$AGENTS_VERSION" ]; then echo "Lid Agents is up to date ($latest)."; return 0; fi
   echo "Updating Lid Agents $AGENTS_VERSION → $latest"
   curl -fsSL "https://github.com/$repo/releases/download/v$latest/install.sh" | LID_AGENTS_VERSION="$latest" bash
+}
+
+# --- Phone alerts (ntfy: https://ntfy.sh or a self-hosted server; no account needed) ---
+
+phone_url() { head -1 "$PHONE_FILE" 2>/dev/null; }
+
+# The URL without its topic, for anything that's printed or logged
+phone_where() { phone_url | sed -E 's#^(https?://[^/]+)/.*#\1#'; }
+
+# phone_send <title> <message> [priority] [tags]. Quiet, bounded and best effort: a failed
+# send is logged (without the topic) and never stops the caller.
+phone_send() {
+  local url; url="$(phone_url)"
+  [ -n "$url" ] || return 0
+  if ! curl -fsS -m 15 -o /dev/null -H "Title: $1" -H "Priority: ${3:-default}" -H "Tags: ${4:-}" \
+      --data-binary "$2" "$url" 2>/dev/null; then
+    log "phone: couldn't reach $(phone_where)"
+    return 1
+  fi
+}
+
+phone_save() {
+  mkdir -p "$CONFIG_DIR"
+  (umask 077; printf '%s\n' "$1" > "$PHONE_FILE")
+}
+
+phone_test() {
+  if phone_send "Lid Agents" "Phone alerts work. You'll hear from your Mac here while agents run with the lid closed." default "white_check_mark"; then
+    echo "Sent a test alert to $(phone_where)."
+  else
+    echo "agents: couldn't send to $(phone_where). Check the URL and your connection." >&2
+    return 1
+  fi
+}
+
+cmd_phone() {
+  local topic url
+  case "${1:-}" in
+    "")
+      if [ -n "$(phone_url)" ]; then
+        echo "Phone alerts: on, through $(phone_where)"
+        echo "  agents phone test · agents phone off"
+      else
+        echo "Phone alerts: off"
+        echo "  agents phone setup     a private ntfy.sh topic (install the free ntfy app and subscribe)"
+        echo "  agents phone <URL>     your own ntfy server or topic, e.g. https://ntfy.example.com/my-topic"
+      fi ;;
+    setup)
+      # A long random topic: on ntfy.sh, anyone who knows the topic can read it
+      topic="lid-agents-$(LC_ALL=C tr -dc 'a-z0-9' < /dev/urandom | head -c 24)"
+      phone_save "https://ntfy.sh/$topic"
+      echo "Phone alerts: on. In the ntfy app (iOS, Android or https://ntfy.sh/app), subscribe to:"
+      echo "  $topic"
+      echo "  (or open https://ntfy.sh/$topic on your phone). Keep it private: anyone with the topic can read it."
+      phone_test || true ;;
+    off)
+      rm -f "$PHONE_FILE"
+      echo "Phone alerts: off" ;;
+    test)
+      [ -n "$(phone_url)" ] || { echo "agents: phone alerts are off. Run: agents phone setup" >&2; exit 1; }
+      phone_test || exit 1 ;;
+    http://*|https://*)
+      url="$1"
+      case "$url" in *[[:space:]]*) echo "agents: that URL has spaces in it" >&2; exit 1 ;; esac
+      phone_save "$url"
+      echo "Phone alerts: on, through $(phone_where)"
+      phone_test || true ;;
+    *)
+      echo "agents: use agents phone setup, agents phone <ntfy URL>, agents phone test or agents phone off" >&2
+      exit 1 ;;
+  esac
 }
 
 current_hotkey() { defaults read "$BUNDLE_ID" Hotkey 2>/dev/null || echo "ctrl+0"; }
@@ -774,7 +850,7 @@ cmd_uninstall() {
   done < <(hook_files)
   if [ -L "$LINK" ]; then rm -f "$LINK"; fi
   if [ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ]; then rm -rf "$APP_BUNDLE" && echo "Removed $APP_BUNDLE"; fi
-  rm -rf "$STATE_DIR"
+  rm -rf "$STATE_DIR" "$CONFIG_DIR"
   echo "Lid Agents is uninstalled. Closing the lid sleeps the Mac as normal."
   if command -v codex >/dev/null 2>&1; then
     local home header=0
@@ -801,6 +877,7 @@ case "${1:-status}" in
   integrate)  shift; cmd_integrate "$@" ;;
   hotkey)     shift; cmd_hotkey "$@" ;;
   wait)       shift; cmd_wait "$@" ;;
+  phone)      shift; cmd_phone "$@" ;;
   uninstall)  cmd_uninstall ;;
   update)     cmd_update ;;
   version|--version|-v) echo "lid-agents $AGENTS_VERSION" ;;
