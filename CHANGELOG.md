@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.2.0
+
+- **Agents waiting on you don't keep a closed Mac awake.** An agent stopped on a permission prompt or a question now shows as **needs input** (in `agents busy` and the cup's **Busy agents** menu) and doesn't count as busy, so once nothing else is working, Lid Agents pauses after 3 idle minutes and the closed Mac sleeps, rather than waiting out the 30-minute quiet limit. Run `agents integrate` to set it up:
+  - **Claude Code** and **Codex** get hooks (in `~/.claude/settings.json` and each Codex home's `hooks.json`) that run `agents mark` when the agent stops on a prompt and when it moves on. They're tagged, print nothing and always succeed; your other hooks stay as they are, and a `.lid-agents.bak` copy is kept before the first change. Codex asks you to review new hooks once (`/hooks`).
+  - **OpenCode**: the plugin does the same on its permission and question events.
+- `agents uninstall` removes the hooks too.
+
 ## 1.1.0
 
 - **Codex and OpenCode count as busy for the whole task**, not only while their own CPU use is high. Before, a Codex or OpenCode session that was waiting on the model or on a long test run looked idle, and Lid Agents could pause partway through. Run `agents integrate` once:
