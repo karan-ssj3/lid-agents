@@ -9,7 +9,8 @@
 #   agents toggle                 switch between keep and pause
 #   agents                        status
 #   agents busy                   which agent processes count as busy (or need you) right now
-#   agents phone [setup|URL|test|off]  phone alerts (ntfy) while agents run with the lid closed
+#   agents wait [minutes]         how long a closed Mac stays awake for an agent that needs you
+#                                 (default 3; also under the cup → When an agent needs you)
 #   agents hotkey [keys|none]     show or set the hotkey, e.g. agents hotkey ctrl+opt+cmd+l
 #   agents install                one-time: passwordless sudo for exactly two pmset commands
 #   agents integrate              let Lid Agents see when Codex and OpenCode are busy, and when
@@ -29,9 +30,10 @@
 # session is not busy. `agents integrate` sets up the Codex and OpenCode parts.
 #
 # "Needs input" = an agent that has stopped on a permission prompt or a question (reported by the
-# hooks and plugin `agents integrate` installs) and isn't using CPU. It doesn't count as busy, so
-# a closed Mac doesn't stay awake for an answer nobody can give; with `agents phone` set up, you
-# get an alert instead.
+# hooks and plugin `agents integrate` installs), isn't using CPU and hasn't started anything
+# since. With the lid closed it keeps the Mac awake for the wait time (default 3 minutes, enough
+# to answer from a phone if you want it longer), then the Mac sleeps. With the lid open it counts
+# as busy: someone may be there to answer, and keep mode shouldn't switch off mid-read.
 
 set -u
 
@@ -59,6 +61,20 @@ IDLE_MINUTES="${AGENTS_IDLE_MINUTES:-3}"
 QUIET_MINUTES="${AGENTS_QUIET_MINUTES:-30}"
 QUIET_CPU="${AGENTS_QUIET_CPU:-1}"
 DEFAULT_HOURS="${AGENTS_HOURS:-8}"
+DEFAULT_WAIT_MINUTES=3
+# A process an agent started after it was marked as waiting, alive at least this long, means the
+# prompt was answered and a tool is running (statusline and hook commands are shorter-lived)
+NEW_CHILD_SECONDS=10
+HOOK_FILES="$STATE_DIR/hook-files"             # every settings/hooks file integrate edited
+
+# Minutes a closed Mac stays awake for an agent that needs input. Read on every guard pass, so
+# the menu bar's "When an agent needs you" choice applies to a keep that's already running.
+wait_minutes() {
+  local v="${AGENTS_WAIT_MINUTES:-}"
+  [ -n "$v" ] || v="$(defaults read "$BUNDLE_ID" WaitMinutes 2>/dev/null)"
+  case "$v" in ''|*[!0-9]*) v="$DEFAULT_WAIT_MINUTES" ;; esac
+  echo "$v"
+}
 
 KEEP_TEXT="Lid closed → agents keep running"
 PAUSE_TEXT="Lid closed → Mac sleeps, agents pause"
@@ -98,67 +114,71 @@ lid_closed() { ioreg -r -k AppleClamshellState -d 1 | grep -q '"AppleClamshellSt
 
 guard_running() { [ -f "$GUARD_PID" ] && kill -0 "$(cat "$GUARD_PID")" 2>/dev/null; }
 
-# What the detection reads, one function each so tests/run.sh can swap in fixtures
-# (AGENTS_TEST_FIXTURE=<dir> with procs, args and assertions files).
-snap_procs() {
-  if [ -n "${AGENTS_TEST_FIXTURE:-}" ]; then cat "$AGENTS_TEST_FIXTURE/procs"; else ps -axo pid=,ppid=,pcpu=,comm=; fi
-}
-snap_args() {   # snap_args <pid,pid,...>
-  if [ -n "${AGENTS_TEST_FIXTURE:-}" ]; then
-    awk -v pids=",$1," 'index(pids, "," $1 ",")' "$AGENTS_TEST_FIXTURE/args" 2>/dev/null
-  else
-    ps -ww -o pid=,args= -p "$1" 2>/dev/null
-  fi
-}
-snap_assertions() {
-  if [ -n "${AGENTS_TEST_FIXTURE:-}" ]; then cat "$AGENTS_TEST_FIXTURE/assertions" 2>/dev/null; else pmset -g assertions 2>/dev/null; fi
-}
-pid_alive() {
-  if [ -n "${AGENTS_TEST_FIXTURE:-}" ]; then awk -v p="$1" '$1 == p { f = 1 } END { exit !f }' "$AGENTS_TEST_FIXTURE/procs"
-  else kill -0 "$1" 2>/dev/null; fi
-}
-
 # PIDs holding a power assertion that stops idle sleep, one per line. Codex holds one in its
 # own process while a turn runs (`codex features enable prevent_idle_sleep`).
 sleep_assertion_pids() {
-  snap_assertions | sed -nE \
+  pmset -g assertions 2>/dev/null | sed -nE \
     's/^[[:space:]]*pid ([0-9]+)\(.*\): \[[^]]*\] [0-9:]+ (PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) .*/\1/p'
 }
 
-# "waiting <pid>" for each agent a hook or the OpenCode plugin marked as stopped on a prompt.
-# Markers whose agent has exited are removed here.
+# Every process: "pid ppid %cpu elapsed-seconds command"
+proc_table() {
+  ps -axo pid=,ppid=,pcpu=,etime=,comm= | awk '{
+    t = $4; s = 0; d = 0
+    if (index(t, "-")) { split(t, dt, "-"); d = dt[1]; t = dt[2] }
+    n = split(t, hms, ":"); for (i = 1; i <= n; i++) s = s * 60 + hms[i]
+    $4 = s + d * 86400; print }'
+}
+
+# Descendants of <pid> that aren't caffeinate, comma-separated (the snapshot `mark waiting` keeps)
+descendants() {   # descendants <pid> [proc table]
+  printf '%s\n' "${2:-$(proc_table)}" | awk -v root="$1" '
+    { pp[$1] = $2; c = $5; for (i = 6; i <= NF; i++) c = c " " $i; sub(/.*\//, "", c); nm[$1] = c
+      if ($1 != $2) kids[$2] = kids[$2] " " $1 }
+    function walk(p, depth,    n, i, k) {
+      if (depth > 32) return
+      n = split(kids[p], k, " ")
+      for (i = 1; i <= n; i++) { if (nm[k[i]] != "caffeinate") out = out (out == "" ? "" : ",") k[i]; walk(k[i], depth + 1) }
+    }
+    END { walk(root, 0); print out }'
+}
+
+# "waiting <pid> <descendants when marked>" for each agent a hook or the OpenCode plugin marked as
+# stopped on a prompt. Markers (and clear stamps) of agents that have exited are removed here.
 waiting_pids() {
-  local f pid
+  local f pid snap
   [ -d "$WAITING_DIR" ] || return 0
-  for f in "$WAITING_DIR"/*; do
+  for f in "$WAITING_DIR"/* "$WAITING_DIR"/.clear-*; do
     [ -f "$f" ] || continue
-    pid="${f##*/}"
+    pid="${f##*/}"; pid="${pid#.clear-}"
     case "$pid" in ''|*[!0-9]*) rm -f "$f"; continue ;; esac
-    if pid_alive "$pid"; then echo "waiting $pid"; else rm -f "$f"; fi
+    if ! kill -0 "$pid" 2>/dev/null; then rm -f "$f"; continue; fi
+    case "$f" in */.clear-*) continue ;; esac
+    snap="$(sed -n 2p "$f" 2>/dev/null)"
+    echo "waiting $pid ${snap:--}"
   done
 }
 
-# Prints "pid name why" for each busy agent, where why is always two words (the menu bar app
-# reads the folder from the fifth field). Names match the executable's basename exactly, so
-# the Claude desktop app ("Claude") and its helpers never count. Agents installed through
-# npm, bun or pip run as node/bun/python, so for those the script name in the command line
-# counts instead (`node /opt/homebrew/bin/gemini` is gemini). None of this depends on which
-# terminal or app started the agent. An agent is busy when:
+# Prints "pid name why why cpu" for every agent that's busy or needs input. Names match the
+# executable's basename exactly, so the Claude desktop app ("Claude") and its helpers never count.
+# Agents installed through npm, bun or pip run as node/bun/python, so for those the script name in
+# the command line counts instead (`node /opt/homebrew/bin/gemini` is gemini). None of this
+# depends on which terminal or app started the agent. An agent is busy when:
 #   - it has a caffeinate child: Claude Code while working, OpenCode with the Lid Agents plugin
 #   - it holds a sleep assertion itself: Codex with prevent_idle_sleep on
 #   - it and its child processes use >= AGENTS_CPU % CPU together: anything else, including
 #     an agent whose work runs in children (a long test suite, `codex exec`)
-# An agent marked as waiting on a prompt that isn't using CPU is "needs input" instead, and
-# is not busy. agent_report prints "pid name why why cpu" for both kinds; busy_agents and
-# waiting_agents split it.
+# It "needs input" instead when it's marked as waiting on a prompt, its process tree is under
+# AGENTS_CPU, and nothing it started since the mark has run for NEW_CHILD_SECONDS (if it has,
+# the prompt was answered and an approved tool is running, whatever the marker still says).
 INTERPRETERS='^(node|bun|deno|python[0-9.]*|Python|ruby)$'
 agent_report() {
   local procs scan interp=""
-  procs="$(snap_procs)"
+  procs="$(proc_table)"
   # One cheap pass first: is any agent (or interpreter that might be one) running at all?
   scan="$(printf '%s\n' "$procs" | awk -v names="$AGENT_NAMES" -v interp="$INTERPRETERS" '
     BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
-    { c = $4; for (i = 5; i <= NF; i++) c = c " " $i; sub(/.*\//, "", c)
+    { c = $5; for (i = 6; i <= NF; i++) c = c " " $i; sub(/.*\//, "", c)
       if (c in want) found = 1
       if (c ~ interp) { found = 1; pids = pids (pids == "" ? "" : ",") $1 } }
     END { print (found ? "yes" : "no"), pids }')"
@@ -167,11 +187,11 @@ agent_report() {
   {
     printf '%s\n' "$procs"
     # Full command lines only for interpreter processes, never every process on the Mac
-    if [ -n "$interp" ]; then snap_args "$interp" | sed 's/^ */args /'; fi
+    if [ -n "$interp" ]; then ps -ww -o pid=,args= -p "$interp" 2>/dev/null | sed 's/^ */args /'; fi
     sleep_assertion_pids | sed 's/^/assertion /'
     waiting_pids
   } |
-  awk -v names="$AGENT_NAMES" -v thr="$CPU_THRESHOLD" -v interp="$INTERPRETERS" '
+  awk -v names="$AGENT_NAMES" -v thr="$CPU_THRESHOLD" -v interp="$INTERPRETERS" -v fresh="$NEW_CHILD_SECONDS" '
     function base(s) { sub(/.*\//, "", s); return s }
     # CPU of a process plus all its descendants (depth-limited against pid reuse cycles)
     function tree_cpu(p, depth,    total, n, i, kid) {
@@ -181,9 +201,19 @@ agent_report() {
       for (i = 1; i <= n; i++) total += tree_cpu(kid[i], depth + 1)
       return total
     }
+    # A descendant started after the mark (not in the snapshot) that has lived >= fresh seconds
+    function started_since(p, snap, depth,    n, i, kid) {
+      if (depth > 32) return 0
+      n = split(kids[p], kid, " ")
+      for (i = 1; i <= n; i++) {
+        if (name[kid[i]] != "caffeinate" && !index(snap, "," kid[i] ",") && age[kid[i]] >= fresh) return 1
+        if (started_since(kid[i], snap, depth + 1)) return 1
+      }
+      return 0
+    }
     BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
     $1 == "assertion" { asserted[$2] = 1; next }
-    $1 == "waiting" { waiting[$2] = 1; next }
+    $1 == "waiting" { waiting[$2] = "," $3 ","; next }
     $1 == "args" {
       pid = $2
       if (!(pid in name) || name[pid] !~ interp) next
@@ -196,9 +226,9 @@ agent_report() {
       next
     }
     {
-      pid = $1; ppid[pid] = $2; cpu[pid] = $3
+      pid = $1; ppid[pid] = $2; cpu[pid] = $3; age[pid] = $4
       if (pid != $2) kids[$2] = kids[$2] " " pid
-      comm = $4; for (i = 5; i <= NF; i++) comm = comm " " $i
+      comm = $5; for (i = 6; i <= NF; i++) comm = comm " " $i
       name[pid] = base(comm)
       if (name[pid] in want) agent[pid] = 1
     }
@@ -207,21 +237,17 @@ agent_report() {
       for (p in name) if (name[p] == "caffeinate" && (ppid[p] in agent)) why[ppid[p]] = "caffeinate child"
       for (p in agent) if (!(p in why) && (p in asserted)) why[p] = "sleep assertion"
       for (p in agent) if (!(p in why) && total[p] >= thr) why[p] = sprintf("cpu %.1f%%", total[p])
-      # Stopped on a prompt: not busy, whatever else it holds. Using CPU means it was answered
-      # and is working again (the hook that clears the marker fires when the tool finishes).
-      for (p in agent) if ((p in waiting) && total[p] < thr) why[p] = "needs input"
+      for (p in agent)
+        if ((p in waiting) && total[p] < thr && !started_since(p, waiting[p], 0)) why[p] = "needs input"
       for (p in why) print p, name[p], why[p], sprintf("%.1f", total[p])
     }'
 }
 
-# "pid name why" per busy agent; --cpu adds the combined CPU % (the guard's quiet check)
+# "pid name why" per busy agent (not counting ones that need input); --cpu adds the combined CPU %
 busy_agents() {
   if [ "${1:-}" = "--cpu" ]; then agent_report | awk '$3 " " $4 != "needs input"'
   else agent_report | awk '$3 " " $4 != "needs input" { print $1, $2, $3, $4 }'; fi
 }
-
-# "pid name" per agent stopped on a prompt
-waiting_agents() { agent_report | awk '$3 " " $4 == "needs input" { print $1, $2 }'; }
 
 busy_count() { busy_agents | wc -l | tr -d ' '; }
 
@@ -248,6 +274,7 @@ start_guard() {
     trap 'exit 0' TERM
     idle=0
     quiet=0
+    waited=0
     while sleep 60; do
       keeping || exit 0                             # paused elsewhere
       reason=""
@@ -256,20 +283,32 @@ start_guard() {
       elif on_battery && [ "$(battery_pct)" -le "$MIN_BATTERY" ]; then
         reason="battery at $(battery_pct)% (floor ${MIN_BATTERY}%)"
       elif [ "$mode" = "busy" ]; then
-        report="$(busy_agents --cpu)"
-        if [ -z "$report" ]; then
-          idle=$((idle + 1)); quiet=0
+        report="$(agent_report)"
+        if lid_closed; then
+          busy="$(printf '%s\n' "$report" | awk 'NF && $3 " " $4 != "needs input"')"
+          waiting="$(printf '%s\n' "$report" | awk 'NF && $3 " " $4 == "needs input"')"
         else
-          idle=0
+          # Lid open: someone may be there to answer, so a prompt counts as busy
+          busy="$report"; waiting=""
+        fi
+        if [ -n "$busy" ]; then
+          idle=0; waited=0
           # every busy agent is near 0% CPU (with its children): waiting, not working
-          if printf '%s\n' "$report" | awk -v q="$QUIET_CPU" '$NF + 0 >= q { active = 1 } END { exit active }'; then
+          if printf '%s\n' "$busy" | awk -v q="$QUIET_CPU" '$NF + 0 >= q { active = 1 } END { exit active }'; then
             quiet=$((quiet + 1))
           else
             quiet=0
           fi
+        elif [ -n "$waiting" ]; then
+          idle=0; quiet=0; waited=$((waited + 1))
+        else
+          idle=$((idle + 1)); quiet=0; waited=0
         fi
+        wait_for="$(wait_minutes)"
         if [ "$idle" -ge "$IDLE_MINUTES" ]; then
           reason="no agent busy for ${IDLE_MINUTES} min"
+        elif [ "$waited" -ge "$wait_for" ]; then
+          reason="an agent needed you for ${wait_for} min with the lid closed"
         elif [ "$quiet" -ge "$QUIET_MINUTES" ]; then
           reason="agents waiting with no activity for ${QUIET_MINUTES} min (probably on you)"
         fi
@@ -337,7 +376,9 @@ cmd_status() {
   else
     echo "$PAUSE_TEXT"
   fi
-  echo "  busy:    $(busy_count) agent(s)"
+  local report; report="$(agent_report)"
+  echo "  busy:    $(printf '%s\n' "$report" | awk 'NF && $3 " " $4 != "needs input"' | wc -l | tr -d ' ') agent(s)"
+  echo "  waiting: $(printf '%s\n' "$report" | awk 'NF && $3 " " $4 == "needs input"' | wc -l | tr -d ' ') need you · a closed Mac stays awake $(wait_minutes) min for an answer (agents wait)"
   echo "  battery: $(battery_pct)% $(on_battery && echo '(on battery)' || echo '(on AC)') · lid $(lid_closed && echo closed || echo open)"
   echo "  hotkey:  $(current_hotkey)"
   if ! pgrep -x LidAgents >/dev/null; then
@@ -363,7 +404,8 @@ agent_folder() { lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p'; }
 
 # Busy agents first, then any that need input ("needs input" is the why the app looks for)
 cmd_busy() {
-  local out; out="$(agent_report | sort -k3,3 -s | awk '{ print $1, $2, $3, $4 }')"
+  local out
+  out="$(agent_report | awk '{ print ($3 " " $4 == "needs input" ? 1 : 0), $1, $2, $3, $4 }' | sort -s -k1,1n | cut -d' ' -f2-)"
   if [ -z "$out" ]; then echo "No busy agents (watching: $AGENT_NAMES)"; return 0; fi
   echo "$out" | while read -r pid name why1 why2; do
     printf '%-7s %-10s %-16s %s\n' "$pid" "$name" "$why1 $why2" "$(agent_folder "$pid")"
@@ -374,15 +416,15 @@ cmd_busy() {
 # itself, but a wrapper in between is fine too. Interpreter processes count by their command line.
 agent_ancestor() {
   local chain pid name
-  chain="$(snap_procs | awk -v start="$1" '
-    { pp[$1] = $2; c = $4; for (i = 5; i <= NF; i++) c = c " " $i; sub(/.*\//, "", c); nm[$1] = c }
+  chain="$(proc_table | awk -v start="$1" '
+    { pp[$1] = $2; c = $5; for (i = 6; i <= NF; i++) c = c " " $i; sub(/.*\//, "", c); nm[$1] = c }
     END { p = start; for (d = 0; d < 16 && (p in nm); d++) { print p, nm[p]; if (pp[p] == p) break; p = pp[p] } }')"
   while read -r pid name; do
     [ -n "$pid" ] || continue
     case " $AGENT_NAMES " in *" $name "*) echo "$pid"; return 0 ;; esac
     if printf '%s' "$name" | grep -Eq "$INTERPRETERS"; then
       # same rule as agent_report: process title, else the first non-flag argument
-      if snap_args "$pid" | awk -v names="$AGENT_NAMES" '
+      if ps -ww -o pid=,args= -p "$pid" 2>/dev/null | awk -v names="$AGENT_NAMES" '
           BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
           { for (i = 2; i <= NF; i++) { if (i > 2 && $i ~ /^-/) continue; b = $i; sub(/.*\//, "", b)
               if (b in want) { f = 1; exit } ; if (i > 2) exit } }
@@ -406,11 +448,24 @@ cmd_mark() {
     esac
   done
   case "$kind" in permission|question|input) ;; *) kind="input" ;; esac
-  agent="$(agent_ancestor "${pid:-$PPID}")" || return 0
+  pid="${pid:-$PPID}"
+  # The directory must exist before the slow part, so a clear hook that fires meanwhile leaves
+  # its stamp (hook_clear_cmd only stamps when the directory is there)
   mkdir -p "$WAITING_DIR"
+  local started procs; started="$(date +%s)"
+  agent="$(agent_ancestor "$pid")" || return 0
   case "$what" in
-    waiting) printf '%s %s\n' "$(date +%s)" "$kind" > "$WAITING_DIR/$agent" ;;
-    working) rm -f "$WAITING_DIR/$agent" ;;
+    waiting)
+      procs="$(proc_table)"
+      printf '%s %s\n%s\n' "$started" "$kind" "$(descendants "$agent" "$procs")" > "$WAITING_DIR/$agent"
+      # A clear stamped at or after our start means the prompt was already answered: drop the mark
+      local stamp p
+      for p in "$pid" "$agent"; do
+        stamp="$WAITING_DIR/.clear-$p"
+        if [ -f "$stamp" ] && [ "$(stat -f %m "$stamp")" -ge "$started" ]; then rm -f "$WAITING_DIR/$agent"; fi
+      done
+      ;;
+    working) rm -f "$WAITING_DIR/$agent" "$WAITING_DIR/$pid"; : > "$WAITING_DIR/.clear-$agent" ;;
   esac
   return 0
 }
@@ -507,12 +562,13 @@ refresh_opencode_plugin() {
 }
 
 # Hook commands. They run in a shell whose parent is the agent ($PPID), print nothing and
-# always succeed. Clearing is a shell test unless some agent is actually marked as waiting.
+# always succeed. Clearing is pure shell (no `agents`): it removes the agent's mark and leaves a
+# stamp, so a slower `mark waiting` that started before it knows it lost the race.
 hook_wait_cmd() {   # hook_wait_cmd <kind>
   printf '%s' "A=\"\$HOME/.local/bin/agents\"; [ -x \"\$A\" ] && \"\$A\" mark waiting --pid \"\$PPID\" --kind $1 >/dev/null 2>&1; true $HOOK_TAG"
 }
 hook_clear_cmd() {
-  printf '%s' "d=\"\$HOME/.cache/lid-agents/waiting\"; [ -n \"\$(ls -A \"\$d\" 2>/dev/null)\" ] && \"\$HOME/.local/bin/agents\" mark working --pid \"\$PPID\" >/dev/null 2>&1; true $HOOK_TAG"
+  printf '%s' "d=\"\$HOME/.cache/lid-agents/waiting\"; [ -d \"\$d\" ] && { rm -f \"\$d/\$PPID\"; : > \"\$d/.clear-\$PPID\"; } 2>/dev/null; true $HOOK_TAG"
 }
 
 # Claude Code and Codex share the hooks JSON shape: { hooks: { Event: [ { matcher?, hooks: [
@@ -527,13 +583,21 @@ edit_hooks_json() {   # edit_hooks_json <file> add|remove [spec]
   if [ "$mode" = "remove" ] && { [ ! -f "$file" ] || ! grep -qF "$HOOK_TAG" "$file"; }; then return 0; fi
   mkdir -p "$(dirname "$file")"
   if [ -f "$file" ] && [ ! -e "$file.lid-agents.bak" ]; then cp -p "$file" "$file.lid-agents.bak"; fi
-  osascript -l JavaScript - "$file" "$mode" "$HOOK_TAG" "$spec" <<'JXA' >/dev/null
+  osascript -l JavaScript - "$file" "$mode" "$HOOK_TAG" "$spec" <<'JXA' >/dev/null || return 1
 function run(argv) {
   const [path, mode, tag, spec] = argv;
-  let data = {};
-  if ($.NSFileManager.defaultManager.fileExistsAtPath(path)) {
-    const text = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null)) || "";
+  const fm = $.NSFileManager.defaultManager;
+  let data = {}, before = null, perms = null;
+  if (fm.fileExistsAtPath(path)) {
+    // Unreadable or not UTF-8: fail and leave the file alone (never replace it with just hooks)
+    const raw = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null);
+    if (raw.isNil()) throw new Error("couldn't read " + path);
+    const text = ObjC.unwrap(raw);
     if (text.trim()) data = JSON.parse(text);           // invalid JSON: fail, leave the file alone
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("not a JSON object: " + path);
+    before = JSON.stringify(data);
+    const attrs = fm.attributesOfItemAtPathError(path, null);
+    if (!attrs.isNil()) perms = attrs.objectForKey($.NSFilePosixPermissions);
   }
   const hooks = (data.hooks && typeof data.hooks === "object") ? data.hooks : {};
   const ours = (h) => h && typeof h.command === "string" && h.command.includes(tag);
@@ -556,11 +620,28 @@ function run(argv) {
     }
   }
   if (Object.keys(hooks).length) data.hooks = hooks; else delete data.hooks;
+  // Nothing to change (the usual case at each app launch): don't rewrite the user's file
+  if (before !== null && JSON.stringify(data) === before) return "unchanged";
   const ok = $(JSON.stringify(data, null, 2) + "\n").writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
   if (!ok) throw new Error("couldn't write " + path);
+  // The atomic write makes a new file: give it the old one's permissions (e.g. 600 with API keys)
+  if (perms && !perms.isNil()) {
+    fm.setAttributesOfItemAtPathError($.NSDictionary.dictionaryWithObjectForKey(perms, $.NSFilePosixPermissions), path, null);
+  }
   return "ok";
 }
 JXA
+  if [ "$mode" = "add" ] && ! grep -qxF "$file" "$HOOK_FILES" 2>/dev/null; then echo "$file" >> "$HOOK_FILES"; fi
+}
+
+# Files that may hold our hooks: the ones integrate recorded (so a custom CLAUDE_CONFIG_DIR is
+# still found from the app, which doesn't inherit it) plus the default locations
+hook_files() {
+  {
+    cat "$HOOK_FILES" 2>/dev/null
+    echo "$CLAUDE_SETTINGS"
+    codex_homes | sed 's|$|/hooks.json|'
+  } | awk 'NF && !seen[$0]++'
 }
 
 # Claude Code: Notification fires once the prompt is on screen (permission, MCP elicitation,
@@ -568,8 +649,8 @@ JXA
 claude_hook_spec() {
   local wait clear e
   wait="$(hook_wait_cmd permission)"; clear="$(hook_clear_cmd)"
-  printf 'Notification\tpermission_prompt\t%s\n' "$wait"
-  printf 'Notification\telicitation_dialog|agent_needs_input\t%s\n' "$(hook_wait_cmd question)"
+  printf 'Notification\tpermission_prompt|worker_permission_prompt\t%s\n' "$wait"
+  printf 'Notification\telicitation_dialog|elicitation_url_dialog|agent_needs_input\t%s\n' "$(hook_wait_cmd question)"
   for e in UserPromptSubmit PostToolUse PostToolUseFailure ElicitationResult Stop StopFailure SessionEnd; do
     printf '%s\t\t%s\n' "$e" "$clear"
   done
@@ -609,16 +690,31 @@ integrate_hooks() {
   echo "          Codex asks you to review new hooks once (/hooks in a Codex session); Superset's Codex runs them as is."
 }
 
+# agents wait [minutes]: how long a closed Mac stays awake for an agent that needs input.
+# The same setting as the menu bar's "When an agent needs you"; a running keep picks it up.
+cmd_wait() {
+  local m="${1:-}"
+  if [ -z "$m" ]; then
+    echo "A closed Mac stays awake $(wait_minutes) min for an agent that needs you, then sleeps."
+    echo "  change it: agents wait 10   (minutes; also under the cup → When an agent needs you)"
+    return 0
+  fi
+  m="${m%m}"; m="${m%min}"
+  case "$m" in ''|*[!0-9]*) echo "agents: minutes must be a whole number, got '$1'" >&2; exit 1 ;; esac
+  defaults write "$BUNDLE_ID" WaitMinutes -int "$m"
+  echo "A closed Mac now stays awake $m min for an agent that needs you."
+}
+
 cmd_integrate() {
   # --refresh: quiet upgrade step, run by install.sh and the app at launch; changes nothing new
   if [ "${1:-}" = "--refresh" ]; then
     refresh_opencode_plugin
-    # rewrite our hooks where they're installed, so upgrades carry new hook commands
-    if grep -qF "$HOOK_TAG" "$CLAUDE_SETTINGS" 2>/dev/null; then edit_hooks_json "$CLAUDE_SETTINGS" add "$(claude_hook_spec)"; fi
-    local h
-    while IFS= read -r h; do
-      if grep -qF "$HOOK_TAG" "$h/hooks.json" 2>/dev/null; then edit_hooks_json "$h/hooks.json" add "$(codex_hook_spec)"; fi
-    done < <(codex_homes)
+    # bring our hooks up to date where they're installed (a no-op unless an upgrade changed them)
+    local f
+    while IFS= read -r f; do
+      grep -qF "$HOOK_TAG" "$f" 2>/dev/null || continue
+      case "$f" in */hooks.json) edit_hooks_json "$f" add "$(codex_hook_spec)" ;; *) edit_hooks_json "$f" add "$(claude_hook_spec)" ;; esac
+    done < <(hook_files)
     return 0
   fi
 
@@ -670,15 +766,12 @@ cmd_uninstall() {
   rm -f "$LAUNCH_AGENT"
   if [ -f "$SUDOERS_FILE" ]; then as_root "rm -f '$SUDOERS_FILE'" && echo "Removed $SUDOERS_FILE"; fi
   if [ -f "$OPENCODE_PLUGIN" ]; then rm -f "$OPENCODE_PLUGIN" && echo "Removed $OPENCODE_PLUGIN"; fi
-  if grep -qF "$HOOK_TAG" "$CLAUDE_SETTINGS" 2>/dev/null; then
-    edit_hooks_json "$CLAUDE_SETTINGS" remove && echo "Removed the Lid Agents hooks from $CLAUDE_SETTINGS"
-  fi
-  local h
-  while IFS= read -r h; do
-    if grep -qF "$HOOK_TAG" "$h/hooks.json" 2>/dev/null; then
-      edit_hooks_json "$h/hooks.json" remove && echo "Removed the Lid Agents hooks from $h/hooks.json"
+  local f
+  while IFS= read -r f; do
+    if grep -qF "$HOOK_TAG" "$f" 2>/dev/null; then
+      edit_hooks_json "$f" remove && echo "Removed the Lid Agents hooks from $f"
     fi
-  done < <(codex_homes)
+  done < <(hook_files)
   if [ -L "$LINK" ]; then rm -f "$LINK"; fi
   if [ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ]; then rm -rf "$APP_BUNDLE" && echo "Removed $APP_BUNDLE"; fi
   rm -rf "$STATE_DIR"
@@ -707,6 +800,7 @@ case "${1:-status}" in
   install)    cmd_install ;;
   integrate)  shift; cmd_integrate "$@" ;;
   hotkey)     shift; cmd_hotkey "$@" ;;
+  wait)       shift; cmd_wait "$@" ;;
   uninstall)  cmd_uninstall ;;
   update)     cmd_update ;;
   version|--version|-v) echo "lid-agents $AGENTS_VERSION" ;;

@@ -2,9 +2,12 @@
 
 ## 1.2.0
 
-- **Agents waiting on you don't keep a closed Mac awake.** An agent stopped on a permission prompt or a question now shows as **needs input** (in `agents busy` and the cup's **Busy agents** menu) and doesn't count as busy, so once nothing else is working, Lid Agents pauses after 3 idle minutes and the closed Mac sleeps, rather than waiting out the 30-minute quiet limit. Run `agents integrate` to set it up:
-  - **Claude Code** and **Codex** get hooks (in `~/.claude/settings.json` and each Codex home's `hooks.json`) that run `agents mark` when the agent stops on a prompt and when it moves on. They're tagged, print nothing and always succeed; your other hooks stay as they are, and a `.lid-agents.bak` copy is kept before the first change. Codex asks you to review new hooks once (`/hooks`).
-  - **OpenCode**: the plugin does the same on its permission and question events.
+- **Lid Agents knows when an agent needs you.** An agent stopped on a permission prompt or a question shows as **needs input** in `agents busy` and the cup's **Busy agents** menu (after busy agents). Run `agents integrate` to set it up:
+  - **Claude Code** and **Codex** get hooks (in `~/.claude/settings.json` and each Codex home's `hooks.json`) that run when the agent stops on a prompt and when it moves on. They're tagged, print nothing and always succeed; your other hooks stay as they are, and a `.lid-agents.bak` copy is kept before the first change. Codex asks you to review new hooks once (`/hooks`).
+  - **OpenCode**: the plugin does the same on its permission and question events, per request, and only while no other session is still working.
+- **Choose how long to wait for you.** With the lid closed, a closed Mac stays awake **3 minutes** by default for an agent that needs your answer (enough to answer from your phone), then sleeps. Change it under the cup → **When an agent needs you** (3, 10, 30 or 60 minutes) or with `agents wait <minutes>`. With the lid open, an agent waiting on you counts as busy, so keep doesn't switch off while you read.
+- An approved command that runs for 10 seconds or more means the agent is working again, even before its next hook fires, so a closed Mac never sleeps partway through an approved task.
+- Settings files are edited safely: an unreadable or invalid file is left alone, an unchanged file isn't rewritten (the app checks at every launch), and permissions are kept. Hooks installed under a custom `CLAUDE_CONFIG_DIR` are found again on upgrade and uninstall.
 - `agents uninstall` removes the hooks too.
 
 ## 1.1.0

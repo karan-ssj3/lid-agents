@@ -6,9 +6,10 @@
 // every 4 minutes, and stops it when they are all idle. Like Claude Code's, it expires on its
 // own: `-t` if the renewals stop, `-w` if OpenCode exits without telling us.
 //
-// While a session waits on a permission prompt or a question, it also writes
+// While every busy session is waiting on a permission prompt or a question, it also writes
 // ~/.cache/lid-agents/waiting/<opencode pid>, so Lid Agents counts it as "needs input" rather
-// than busy: a closed Mac shouldn't stay awake for an answer nobody is there to give.
+// than busy. Waiting is tracked per request (two prompts in one session need two answers), and
+// a session that still has work in flight keeps the whole process busy.
 //
 // It works under Superset and cmux too: their OpenCode setups add plugins from their own
 // config dirs, which OpenCode loads in addition to ~/.config/opencode, not instead of it.
@@ -20,17 +21,24 @@ import { join } from "node:path";
 // One OpenCode process can serve several projects, each loading its plugins separately
 // (and this file may be loaded from two config dirs), so the busy sessions and the single
 // caffeinate are per process, not per plugin instance.
-const shared = (globalThis.__lidAgents ??= { busy: new Set(), waiting: new Set(), holder: null, renew: null, exitHooked: false });
+const shared = (globalThis.__lidAgents ??= { busy: new Set(), holder: null, renew: null, exitHooked: false });
 
-shared.waiting ??= new Set();         // a plugin from before 1.2 may have made `shared`
+// sessionID → Set of pending permission/question request IDs. A plugin from before 1.2 may have
+// made `shared` (or a Set here), so replace anything that isn't a Map.
+if (!(shared.waiting instanceof Map)) shared.waiting = new Map();
 
 const WAITING_DIR = join(homedir(), ".cache", "lid-agents", "waiting");
 const WAITING_FILE = join(WAITING_DIR, String(process.pid));
 
-// The marker exists exactly while some session waits on the user
+// Needs input only when something waits and no busy session is working: one session stuck on a
+// prompt mustn't hide another that's still running.
+const allWaiting = () =>
+  shared.waiting.size > 0 && [...shared.busy].every((id) => shared.waiting.has(id));
+
+// The marker exists exactly while allWaiting()
 const syncWaiting = () => {
   try {
-    if (shared.waiting.size > 0) {
+    if (allWaiting()) {
       mkdirSync(WAITING_DIR, { recursive: true });
       writeFileSync(WAITING_FILE, `${Math.floor(Date.now() / 1000)} permission\n`);
     } else {
@@ -89,12 +97,15 @@ export const LidAgentsPlugin = async () => {
 
   return {
     event: async ({ event }) => {
-      const id = event.properties?.sessionID ?? event.properties?.info?.id;
+      const props = event.properties ?? {};
+      const id = props.sessionID ?? props.info?.id;
       if (!id) return;
+      // The request a permission/question event is about; without one, the event covers the session
+      const request = props.permissionID ?? props.requestID ?? props.questionID ?? props.callID ?? props.id;
       switch (event.type) {
         case "session.status":
-          // busy and retry both mean work is in flight
-          if (event.properties?.status?.type === "idle") shared.busy.delete(id);
+          // busy and retry both mean work is in flight; idle ends the turn and any prompt in it
+          if (props.status?.type === "idle") { shared.busy.delete(id); shared.waiting.delete(id); }
           else shared.busy.add(id);
           break;
         case "session.busy":
@@ -102,18 +113,26 @@ export const LidAgentsPlugin = async () => {
           break;
         case "session.idle":
         case "session.deleted":
+        case "session.error":
           shared.busy.delete(id);
           shared.waiting.delete(id);
           break;
         case "permission.asked":
-        case "question.asked":
-          shared.waiting.add(id);
+        case "question.asked": {
+          const pending = shared.waiting.get(id) ?? new Set();
+          pending.add(request ?? event.type);
+          shared.waiting.set(id, pending);
           break;
+        }
         case "permission.replied":
         case "question.replied":
-        case "question.rejected":
-          shared.waiting.delete(id);
+        case "question.rejected": {
+          const pending = shared.waiting.get(id);
+          if (pending && request !== undefined && pending.has(request)) pending.delete(request);
+          else shared.waiting.delete(id);               // unknown request: the session moved on
+          if (pending && pending.size === 0) shared.waiting.delete(id);
           break;
+        }
         default:
           return;
       }
