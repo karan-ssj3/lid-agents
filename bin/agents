@@ -46,6 +46,8 @@ LAUNCH_AGENT="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 LINK="$HOME/.local/bin/agents"
 OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/lid-agents.js"
 WAITING_DIR="$STATE_DIR/waiting"               # <agent pid> files: "<epoch> <kind>", from hooks
+CLAUDE_SETTINGS="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json"
+HOOK_TAG="# lid-agents-hook"                   # marks the hook entries this script owns
 
 MIN_BATTERY="${AGENTS_MIN_BATTERY:-15}"
 AGENT_NAMES="${AGENTS_NAMES:-claude codex gemini aider opencode amp goose cursor-agent droid}"
@@ -504,9 +506,121 @@ refresh_opencode_plugin() {
   cp "$OPENCODE_PLUGIN_SRC" "$OPENCODE_PLUGIN" && log "refreshed OpenCode plugin"
 }
 
+# Hook commands. They run in a shell whose parent is the agent ($PPID), print nothing and
+# always succeed. Clearing is a shell test unless some agent is actually marked as waiting.
+hook_wait_cmd() {   # hook_wait_cmd <kind>
+  printf '%s' "A=\"\$HOME/.local/bin/agents\"; [ -x \"\$A\" ] && \"\$A\" mark waiting --pid \"\$PPID\" --kind $1 >/dev/null 2>&1; true $HOOK_TAG"
+}
+hook_clear_cmd() {
+  printf '%s' "d=\"\$HOME/.cache/lid-agents/waiting\"; [ -n \"\$(ls -A \"\$d\" 2>/dev/null)\" ] && \"\$HOME/.local/bin/agents\" mark working --pid \"\$PPID\" >/dev/null 2>&1; true $HOOK_TAG"
+}
+
+# Claude Code and Codex share the hooks JSON shape: { hooks: { Event: [ { matcher?, hooks: [
+# { type: "command", command } ] } ] } }. Rewrites <file> without this script's entries, then
+# (add) with the ones in <spec>, lines of "Event<TAB>matcher<TAB>command". Everything else in
+# the file is kept; the first change leaves a .lid-agents.bak copy next to it.
+edit_hooks_json() {   # edit_hooks_json <file> add|remove [spec]
+  local file="$1" mode="$2" spec="${3:-}"
+  while [ -L "$file" ]; do
+    case "$(readlink "$file")" in /*) file="$(readlink "$file")" ;; *) file="$(dirname "$file")/$(readlink "$file")" ;; esac
+  done
+  if [ "$mode" = "remove" ] && { [ ! -f "$file" ] || ! grep -qF "$HOOK_TAG" "$file"; }; then return 0; fi
+  mkdir -p "$(dirname "$file")"
+  if [ -f "$file" ] && [ ! -e "$file.lid-agents.bak" ]; then cp -p "$file" "$file.lid-agents.bak"; fi
+  osascript -l JavaScript - "$file" "$mode" "$HOOK_TAG" "$spec" <<'JXA' >/dev/null
+function run(argv) {
+  const [path, mode, tag, spec] = argv;
+  let data = {};
+  if ($.NSFileManager.defaultManager.fileExistsAtPath(path)) {
+    const text = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null)) || "";
+    if (text.trim()) data = JSON.parse(text);           // invalid JSON: fail, leave the file alone
+  }
+  const hooks = (data.hooks && typeof data.hooks === "object") ? data.hooks : {};
+  const ours = (h) => h && typeof h.command === "string" && h.command.includes(tag);
+  for (const event of Object.keys(hooks)) {
+    if (!Array.isArray(hooks[event])) continue;
+    hooks[event] = hooks[event].filter((group) => {
+      if (!group || !Array.isArray(group.hooks) || !group.hooks.some(ours)) return true;
+      group.hooks = group.hooks.filter((h) => !ours(h));
+      return group.hooks.length > 0;
+    });
+    if (hooks[event].length === 0) delete hooks[event];
+  }
+  if (mode === "add") {
+    for (const line of spec.split("\n")) {
+      if (!line) continue;
+      const [event, matcher, command] = line.split("\t");
+      const group = { hooks: [{ type: "command", command }] };
+      if (matcher) group.matcher = matcher;
+      (hooks[event] = hooks[event] || []).push(group);
+    }
+  }
+  if (Object.keys(hooks).length) data.hooks = hooks; else delete data.hooks;
+  const ok = $(JSON.stringify(data, null, 2) + "\n").writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null);
+  if (!ok) throw new Error("couldn't write " + path);
+  return "ok";
+}
+JXA
+}
+
+# Claude Code: Notification fires once the prompt is on screen (permission, MCP elicitation,
+# a background agent's question); the clear events are its next signs of life.
+claude_hook_spec() {
+  local wait clear e
+  wait="$(hook_wait_cmd permission)"; clear="$(hook_clear_cmd)"
+  printf 'Notification\tpermission_prompt\t%s\n' "$wait"
+  printf 'Notification\telicitation_dialog|agent_needs_input\t%s\n' "$(hook_wait_cmd question)"
+  for e in UserPromptSubmit PostToolUse PostToolUseFailure ElicitationResult Stop StopFailure SessionEnd; do
+    printf '%s\t\t%s\n' "$e" "$clear"
+  done
+}
+
+# Codex: PermissionRequest for approvals, request_user_input for its questions
+codex_hook_spec() {
+  local clear e
+  clear="$(hook_clear_cmd)"
+  printf 'PermissionRequest\t\t%s\n' "$(hook_wait_cmd permission)"
+  printf 'PreToolUse\t^request_user_input$\t%s\n' "$(hook_wait_cmd question)"
+  for e in UserPromptSubmit PostToolUse Stop Interrupt SessionEnd; do
+    printf '%s\t\t%s\n' "$e" "$clear"
+  done
+}
+
+# Installs this script's hooks for Claude Code and every Codex home
+integrate_hooks() {
+  local home
+  if command -v claude >/dev/null 2>&1 || [ -d "$(dirname "$CLAUDE_SETTINGS")" ]; then
+    if edit_hooks_json "$CLAUDE_SETTINGS" add "$(claude_hook_spec)"; then
+      echo "Claude:   hooks in $CLAUDE_SETTINGS report when it stops on a prompt"
+    else
+      echo "Claude:   couldn't update $CLAUDE_SETTINGS (is it valid JSON?)" >&2
+    fi
+  else
+    echo "Claude:   not found, skipped."
+  fi
+  command -v codex >/dev/null 2>&1 || return 0
+  while IFS= read -r home; do
+    if edit_hooks_json "$home/hooks.json" add "$(codex_hook_spec)"; then
+      echo "Codex:    hooks in $home/hooks.json report when it stops on a prompt"
+    else
+      echo "Codex:    couldn't update $home/hooks.json (is it valid JSON?)" >&2
+    fi
+  done < <(codex_homes)
+  echo "          Codex asks you to review new hooks once (/hooks in a Codex session); Superset's Codex runs them as is."
+}
+
 cmd_integrate() {
   # --refresh: quiet upgrade step, run by install.sh and the app at launch; changes nothing new
-  if [ "${1:-}" = "--refresh" ]; then refresh_opencode_plugin; return 0; fi
+  if [ "${1:-}" = "--refresh" ]; then
+    refresh_opencode_plugin
+    # rewrite our hooks where they're installed, so upgrades carry new hook commands
+    if grep -qF "$HOOK_TAG" "$CLAUDE_SETTINGS" 2>/dev/null; then edit_hooks_json "$CLAUDE_SETTINGS" add "$(claude_hook_spec)"; fi
+    local h
+    while IFS= read -r h; do
+      if grep -qF "$HOOK_TAG" "$h/hooks.json" 2>/dev/null; then edit_hooks_json "$h/hooks.json" add "$(codex_hook_spec)"; fi
+    done < <(codex_homes)
+    return 0
+  fi
 
   # Codex: its own prevent_idle_sleep feature holds a sleep assertion in the codex process
   # for exactly as long as a turn runs (interactive sessions; `codex exec` doesn't take one,
@@ -542,6 +656,9 @@ cmd_integrate() {
   else
     echo "OpenCode: not found, skipped."
   fi
+  # Claude Code and Codex: hooks that mark an agent stopped on a prompt as "needs input"
+  integrate_hooks
+
   touch "$STATE_DIR/integrated"      # install.sh stops suggesting `agents integrate`
   log "integrate"
 }
@@ -553,6 +670,15 @@ cmd_uninstall() {
   rm -f "$LAUNCH_AGENT"
   if [ -f "$SUDOERS_FILE" ]; then as_root "rm -f '$SUDOERS_FILE'" && echo "Removed $SUDOERS_FILE"; fi
   if [ -f "$OPENCODE_PLUGIN" ]; then rm -f "$OPENCODE_PLUGIN" && echo "Removed $OPENCODE_PLUGIN"; fi
+  if grep -qF "$HOOK_TAG" "$CLAUDE_SETTINGS" 2>/dev/null; then
+    edit_hooks_json "$CLAUDE_SETTINGS" remove && echo "Removed the Lid Agents hooks from $CLAUDE_SETTINGS"
+  fi
+  local h
+  while IFS= read -r h; do
+    if grep -qF "$HOOK_TAG" "$h/hooks.json" 2>/dev/null; then
+      edit_hooks_json "$h/hooks.json" remove && echo "Removed the Lid Agents hooks from $h/hooks.json"
+    fi
+  done < <(codex_homes)
   if [ -L "$LINK" ]; then rm -f "$LINK"; fi
   if [ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ]; then rm -rf "$APP_BUNDLE" && echo "Removed $APP_BUNDLE"; fi
   rm -rf "$STATE_DIR"
