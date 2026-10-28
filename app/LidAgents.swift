@@ -313,7 +313,7 @@ final class HotkeyRecorder: NSObject, NSWindowDelegate {
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    var statusItem: NSStatusItem!
     let menu = NSMenu()
     var hotkey = Hotkey.configured
     var recorder: HotkeyRecorder?
@@ -323,19 +323,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var updateTimer: Timer?
     var availableUpdate: String?
     var updating = false
+    var appliedHotkeySpec: String?      // the Hotkey default last applied, to spot `agents hotkey` changes
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if moveToApplicationsIfNeeded() { return }
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        statusItem = makeStatusItem()
         menu.delegate = self
         statusItem.menu = menu
         statusItem.button?.imagePosition = .imageLeading
 
         hotkeyHandler = { [weak self] in self?.toggle() }
-        setGlobalHotkey(hotkey)
+        appliedHotkeySpec = UserDefaults.standard.string(forKey: "Hotkey")
+        if let hotkey, !setGlobalHotkey(hotkey) {
+            appendLog("hotkey \(hotkey.spec) unavailable: another app has it")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                self.notify("\(hotkey.symbols) isn't available", "Another app is using it. Pick a different one: `agents hotkey ctrl+opt+cmd+l`.")
+            }
+        }
 
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert]) { [weak self] granted, _ in
+            // For `agents` status: without notifications, a switch by hotkey looks like nothing happened
+            try? (granted ? "allowed\n" : "denied\n").write(toFile: stateDir + "/notifications", atomically: true, encoding: .utf8)
             guard granted else { return }
             let defaults = UserDefaults.standard
             let lastRun = defaults.string(forKey: "LastRunVersion")
@@ -591,9 +602,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // MARK: State
 
     func refresh() {
+        reloadHotkeyIfChanged()
         DispatchQueue.global(qos: .utility).async {
             let next = Agents.state()
             DispatchQueue.main.async { self.apply(next) }
+        }
+    }
+
+    // MARK: Menu bar placement
+
+    static let cupName = "LidAgentsCup"
+    static let cupPreferredPosition = 0.0   // distance from the right end; the system items stay right of it
+
+    /// New menu bar items go to the left end of the right-hand group, which on a notched
+    /// display with a busy menu bar is behind the notch, so the cup was hidden. Ask for a spot
+    /// next to the system items instead; ⌘-dragging the cup later saves the user's own choice.
+    func makeStatusItem() -> NSStatusItem {
+        let defaults = UserDefaults.standard
+        let positionKey = "NSStatusItem Preferred Position \(Self.cupName)"
+        if defaults.object(forKey: positionKey) == nil {
+            defaults.set(Self.cupPreferredPosition, forKey: positionKey)
+        }
+        defaults.set(true, forKey: "NSStatusItem Visible \(Self.cupName)")
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.autosaveName = Self.cupName
+        item.isVisible = true
+        return item
+    }
+
+    /// `agents hotkey <keys>` writes the Hotkey default; apply it here without a restart.
+    func reloadHotkeyIfChanged() {
+        let spec = UserDefaults.standard.string(forKey: "Hotkey")
+        guard spec != appliedHotkeySpec else { return }
+        appliedHotkeySpec = spec
+        let next = Hotkey.configured
+        guard next != hotkey else { return }
+        if setGlobalHotkey(next) {
+            hotkey = next
+            appendLog("hotkey: \(next?.spec ?? "none")")
+            notify(next.map { "Hotkey: \($0.symbols)" } ?? "Hotkey off",
+                   next.map { "Press \($0.symbols) anywhere to switch." } ?? "Use the cup in the menu bar to switch.")
+        } else {
+            setGlobalHotkey(hotkey)
+            appendLog("hotkey \(next?.spec ?? "?") unavailable: another app has it")
+            notify("\(next?.symbols ?? "That hotkey") isn't available", "Another app is using it. Pick a different one.")
+        }
+    }
+
+    func appendLog(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "\(formatter.string(from: Date())) \(message)\n"
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        if let handle = FileHandle(forWritingAtPath: logPath) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            handle.closeFile()
+        } else {
+            try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
         }
     }
 

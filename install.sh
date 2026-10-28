@@ -82,6 +82,13 @@ fi
 ln -sfn "$APP/Contents/Resources/agents" "$LINK"
 step "Linked the \`agents\` command: $LINK"
 
+# An upgrade refreshes the OpenCode plugin if `agents integrate` installed it earlier
+OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/lid-agents.js"
+if [ -f "$OPENCODE_PLUGIN" ] && [ -f "$APP/Contents/Resources/opencode-lid-agents.js" ]; then
+  cp "$APP/Contents/Resources/opencode-lid-agents.js" "$OPENCODE_PLUGIN"
+  step "Updated the OpenCode plugin: $OPENCODE_PLUGIN"
+fi
+
 # 4. The one permission that needs your password
 step "Allowing \`pmset -a disablesleep 0|1\` without a password (nothing else)"
 "$LINK" install
@@ -110,6 +117,9 @@ bold "Lid Agents $("$LINK" version | awk '{print $2}') is installed."
 echo "  • Click the cup in the menu bar, or press $hotkey, to keep agents running with the lid closed."
 echo "  • macOS will ask whether \"Lid Agents\" can send notifications: click Allow."
 echo "  • In a terminal: agents keep · agents pause · agents (status) · agents uninstall"
+if ! [ -f "$OPENCODE_PLUGIN" ]; then
+  echo "  • Use Codex or OpenCode? Run \`agents integrate\` so Lid Agents can tell when they're busy."
+fi
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo

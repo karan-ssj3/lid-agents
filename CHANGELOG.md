@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.1.0
+
+- **Codex and OpenCode count as busy for the whole task**, not only while their own CPU use is high. Before, a Codex or OpenCode session that was waiting on the model or on a long test run looked idle, and Lid Agents could pause partway through. Run `agents integrate` once:
+  - **Codex**: switches on Codex's own `prevent_idle_sleep` feature. Codex then holds a sleep assertion while a turn runs, and Lid Agents now counts an agent that holds one as busy. This works in interactive sessions; `codex exec` doesn't take the assertion, so it still relies on CPU use.
+  - **OpenCode**: installs a small plugin, `~/.config/opencode/plugins/lid-agents.js`, that holds `caffeinate` while any session is busy, the same signal Claude Code gives.
+- **Any terminal or app.** Agents count the same in Ghostty, cmux, Superset, Terminal, iTerm or an IDE's terminal: their wrappers keep the agent's process name. Agents installed through npm, bun or pip, which run as `node` or `python`, now count too, by their script name (before, Gemini CLI and an npm-installed Claude Code were never seen). `agents integrate` switches Codex on in every Codex home it finds, including Superset's Codex account, and OpenCode loads the plugin next to the ones Superset and cmux add.
+- **The cup is the last thing a full menu bar hides.** It now asks for a spot next to the clock instead of the left end, which on a notched MacBook is behind the notch. ⌘-drag it anywhere and that place sticks.
+- **`agents hotkey ctrl+opt+cmd+l`** changes the hotkey from a terminal (or `none`); the running app picks it up within seconds. If another app already has the hotkey at launch, you're told instead of it silently doing nothing.
+- `agents` status shows the hotkey, whether the app is running, and when notifications are off (so switching shows no banner).
+- **Fixed:** the menu's **Busy agents** list left out the folder for agents that were busy through `caffeinate`.
+- `agents uninstall` also removes the OpenCode plugin.
+
 ## 1.0.6
 
 - **Download a DMG.** Each release now includes `LidAgents.dmg`: drag Lid Agents into Applications and open it. No terminal needed.

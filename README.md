@@ -36,8 +36,29 @@ agents keep --always   # even when no agent is busy (3h)
 agents pause           # normal lid-close sleep
 agents                 # status
 agents busy            # which agents count as busy, and in which folder
+agents integrate       # let Lid Agents see when Codex and OpenCode are busy
+agents hotkey ctrl+opt+cmd+l   # change the hotkey (or none); applies within seconds
 agents update          # install the latest release
 ```
+
+## Any terminal: Ghostty, cmux, Superset, IDEs
+
+Lid Agents looks at processes, not at the app they run in, so agents count the same in Ghostty, cmux, Superset, Terminal, iTerm, tmux or an IDE's terminal. Wrappers that those apps put in front of `claude`, `codex` or `opencode` keep the agent's process name. Agents installed through npm, bun or pip run as `node` or `python`; for those the script name counts, so `node …/bin/gemini` is Gemini CLI.
+
+## Codex and OpenCode
+
+Claude Code tells Lid Agents when it's working. Codex and OpenCode don't by default, so a session waiting on the model or on a long test run can look idle. Run this once:
+
+```bash
+agents integrate
+```
+
+| Agent | What `agents integrate` does | Then |
+|---|---|---|
+| Codex | Runs `codex features enable prevent_idle_sleep`, Codex's own setting, in each Codex home it finds (`$CODEX_HOME`, `~/.codex`, and Superset's Codex account if you use one). Codex then holds a sleep assertion while a turn runs, which Lid Agents reads. | Busy for the whole turn in interactive sessions. `codex exec` doesn't take the assertion, so it counts only by CPU use. |
+| OpenCode | Copies a small plugin to `~/.config/opencode/plugins/lid-agents.js`. It holds `caffeinate` while any session is busy, the same signal Claude Code gives. OpenCode loads it next to the plugins Superset and cmux add. | Busy for the whole task. |
+
+Restart sessions that are already open to pick it up.
 
 ## Why this needs a tool
 
@@ -48,7 +69,7 @@ macOS has two kinds of sleep:
 
 The one switch that covers the lid is `pmset -a disablesleep 1`. It is global and easy to forget, which is the dangerous part: a Mac that stays awake in a bag gets hot and flattens its battery. Lid Agents handles it for you:
 
-- **Only while agents work.** An agent counts as busy if it has a `caffeinate` child (Claude Code holds one only while working) or uses 5% or more CPU. A session left open and idle in a terminal tab doesn't count.
+- **Only while agents work.** An agent counts as busy if it has a `caffeinate` child (Claude Code holds one only while working, and so does OpenCode with the plugin), holds a sleep assertion itself (Codex with `prevent_idle_sleep`), or uses 5% or more CPU. A session left open and idle in a terminal tab doesn't count.
 - **Turns itself off** after 3 idle minutes, at the 8-hour cap, or when the battery reaches 15%. If the lid is closed when that happens, the Mac goes to sleep straight away.
 - **The screen still turns off.** The lid sensor switches off the built-in display; only system sleep is held.
 
@@ -60,13 +81,13 @@ The one switch that covers the lid is `pmset -a disablesleep 1`. It is global an
 | "Allow notifications" prompt | Notifications when you switch, and when it pauses itself | System Settings → Notifications → Lid Agents |
 | Nothing else | The hotkey uses `RegisterEventHotKey`, which needs **no** Accessibility or Input Monitoring permission. | — |
 
-Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from the one-liner), the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. The app is built from this repo by GitHub Actions, signed with a Developer ID and notarized by Apple, so Gatekeeper opens it without warnings however you install it.
+Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from the one-liner), the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. `agents integrate`, which you run yourself, adds `~/.config/opencode/plugins/lid-agents.js` and sets `prevent_idle_sleep` in `~/.codex/config.toml`. The app is built from this repo by GitHub Actions, signed with a Developer ID and notarized by Apple, so Gatekeeper opens it without warnings however you install it.
 
 ## Settings
 
 | Setting | Default | How to change |
 |---|---|---|
-| Hotkey | ⌃0 | The cup → **Hotkey** → pick a preset, **None**, or **Record New Hotkey…** and press the keys you want. It applies immediately. It needs ⌃, ⌥ or ⌘ with a letter, number or Space. |
+| Hotkey | ⌃0 | The cup → **Hotkey** → pick a preset, **None**, or **Record New Hotkey…** and press the keys you want; or `agents hotkey ctrl+opt+cmd+l` in a terminal. It applies immediately. It needs ⌃, ⌥ or ⌘ with a letter, number or Space. |
 | Agents watched | `claude codex gemini aider opencode amp goose cursor-agent droid` | `AGENTS_NAMES` |
 | Idle minutes before pausing | 3 | `AGENTS_IDLE_MINUTES` |
 | CPU % that counts as busy | 5 | `AGENTS_CPU` |
@@ -94,12 +115,13 @@ Once a day, Lid Agents asks GitHub's public API for the latest release. That one
 agents uninstall
 ```
 
-This switches lid-close sleep back on and removes the app, the command, the login item, the sudoers rule (asking for your password) and the log.
+This switches lid-close sleep back on and removes the app, the command, the login item, the sudoers rule (asking for your password), the OpenCode plugin and the log. Codex's `prevent_idle_sleep` is a Codex setting, so it stays on; `codex features disable prevent_idle_sleep` turns it off.
 
 ## Troubleshooting
 
-- **No cup in the menu bar.** Open **Lid Agents** from Applications (or Spotlight). If your menu bar is full, macOS hides extra icons; menu bar managers like Ice or Bartender can show it.
-- **The hotkey does nothing.** Another app may have claimed the same combination. Pick a different one (see Settings).
+- **No cup in the menu bar.** Open **Lid Agents** from Applications (or Spotlight). The cup asks for a spot next to the clock, so it's the last item a full menu bar hides; if it's still hidden, ⌘-drag it further right, or turn other items off in System Settings → Menu Bar. The hotkey works either way.
+- **The hotkey does nothing.** Another app may have claimed the same combination (Lid Agents tells you at launch when that happens). Pick a different one: `agents hotkey ctrl+opt+cmd+l`.
+- **Switching shows no banner.** Notifications are off for Lid Agents: System Settings → Notifications → Lid Agents. `agents` shows the current state either way.
 - **"Setup incomplete".** Run `agents install`.
 - **Want to see what happened while the lid was closed?** Run `cat ~/.cache/lid-agents/lid-agents.log`.
 
