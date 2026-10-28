@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.3.0
+
+- **Alerts on your phone.** `agents phone setup` makes a private [ntfy](https://ntfy.sh) topic; subscribe in the free ntfy app and, while keep is on, you hear when an agent needs you (with how soon a closed Mac sleeps unless you answer), when the agents finish, and when Lid Agents pauses (cap, battery, wait time, quiet limit), including whether the Mac is going to sleep. Alerts carry only the agent's and its folder's names. `agents phone <URL>` uses your own ntfy server; `agents phone test` and `agents phone off` do what they say.
+- `agents uninstall` removes the phone setting too.
+
 ## 1.2.0
 
 - **Lid Agents knows when an agent needs you.** An agent stopped on a permission prompt or a question shows as **needs input** in `agents busy` and the cup's **Busy agents** menu (after busy agents). Run `agents integrate` to set it up:

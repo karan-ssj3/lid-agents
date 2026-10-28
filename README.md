@@ -42,6 +42,7 @@ agents                 # status
 agents busy            # which agents count as busy (or need you), and in which folder
 agents wait 10         # a closed Mac stays awake 10 min for an agent that needs you (default 3)
 agents integrate       # let Lid Agents see when Codex and OpenCode are busy, and when an agent needs you
+agents phone setup     # alerts on your phone while agents run with the lid closed
 agents hotkey ctrl+opt+cmd+l   # change the hotkey (or none); applies within seconds
 agents update          # install the latest release
 ```
@@ -81,6 +82,26 @@ An agent stopped on a permission prompt or a question isn't working: it's waitin
 
 The hooks run `agents mark` and do nothing else: they print nothing, always succeed, and are tagged `# lid-agents-hook`, so re-running `agents integrate` replaces them and `agents uninstall` removes them, leaving any other hooks alone. The first change to each file keeps a `.lid-agents.bak` copy next to it. An agent that's using CPU again, or has started a long-running command since the prompt, counts as busy straight away. Editing a settings file never replaces it: an unreadable or invalid file is left alone, a file that wouldn't change isn't rewritten, and its permissions are kept.
 
+## Alerts on your phone
+
+Close the lid, walk away, and hear how it's going. Lid Agents sends alerts through [ntfy](https://ntfy.sh), a free push service with apps for iOS and Android and no account needed:
+
+```bash
+agents phone setup     # makes a private topic, prints it, sends a test alert
+```
+
+Subscribe to the printed topic in the ntfy app. While keep is on, you get:
+
+| Alert | When |
+|---|---|
+| **Agent needs you** | An agent has just stopped on a permission prompt or a question (see above). With the lid closed and nothing else busy, it says how soon the Mac sleeps unless you answer, which is the wait time above, so pick one long enough to answer from your phone (`agents wait 10`). |
+| **Agents finished** | Every agent has gone idle and Lid Agents paused. It says whether the Mac is going to sleep, and lists any agent still waiting on you. |
+| **Lid Agents paused** | The cap, the battery floor, the wait time or the quiet limit switched keep off. |
+
+The pause alert goes out before the Mac sleeps, while it's still online. The Mac needs its own internet connection for any of this, so a phone hotspot only works if the phone stays with the Mac.
+
+Alerts carry the agent's name and its folder's name, nothing else. On ntfy.sh anyone who knows a topic can read it, so `setup` makes a long random one and saves it only to `~/.config/lid-agents/phone` (readable by you alone). To use your own ntfy server instead: `agents phone https://ntfy.example.com/my-topic`. `agents phone test` sends a test alert and `agents phone off` stops them.
+
 ## Why this needs a tool
 
 macOS has two kinds of sleep:
@@ -102,7 +123,7 @@ The one switch that covers the lid is `pmset -a disablesleep 1`. It is global an
 | "Allow notifications" prompt | Notifications when you switch, and when it pauses itself | System Settings → Notifications → Lid Agents |
 | Nothing else | The hotkey uses `RegisterEventHotKey`, which needs **no** Accessibility or Input Monitoring permission. | — |
 
-Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from the one-liner), the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. `agents integrate`, which you run yourself, adds `~/.config/opencode/plugins/lid-agents.js`, sets `prevent_idle_sleep` in `~/.codex/config.toml`, and adds tagged hooks to `~/.claude/settings.json` and `~/.codex/hooks.json`. The app is built from this repo by GitHub Actions, signed with a Developer ID and notarized by Apple, so Gatekeeper opens it without warnings however you install it.
+Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from the one-liner), the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. `agents phone`, if you set it up, saves its URL in `~/.config/lid-agents/phone`. `agents integrate`, which you run yourself, adds `~/.config/opencode/plugins/lid-agents.js`, sets `prevent_idle_sleep` in `~/.codex/config.toml`, and adds tagged hooks to `~/.claude/settings.json` and `~/.codex/hooks.json`. The app is built from this repo by GitHub Actions, signed with a Developer ID and notarized by Apple, so Gatekeeper opens it without warnings however you install it.
 
 ## Settings
 
