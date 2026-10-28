@@ -61,7 +61,9 @@ enum Agents {
             let parts = line.split(separator: " ", omittingEmptySubsequences: true).map(String.init)
             guard parts.count >= 3, Int(parts[0]) != nil else { return nil }
             let folder = parts.count > 4 ? parts[4...].joined(separator: " ") : ""
-            return (parts[1], folder)
+            // "needs input": stopped on a prompt, so it isn't counted as busy
+            let waiting = parts.count > 3 && parts[2] == "needs" && parts[3] == "input"
+            return (waiting ? "\(parts[1]) (needs input)" : parts[1], folder)
         }
     }
 
@@ -567,6 +569,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         useHotkey(next)
     }
 
+    // MARK: When an agent needs you
+
+    static let defaultWaitMinutes = 3
+    static let waitChoices = [3, 10, 30, 60]
+
+    /// Minutes a closed Mac stays awake for an agent stopped on a prompt. The `agents` guard reads
+    /// the same WaitMinutes default on every pass, so a change applies to a keep already running.
+    var waitMinutes: Int {
+        let stored = UserDefaults.standard.integer(forKey: "WaitMinutes")
+        return stored > 0 ? stored : Self.defaultWaitMinutes
+    }
+
+    func waitMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: "When an agent needs you: stay awake \(waitMinutes) min", action: nil, keyEquivalent: "")
+        item.image = NSImage(systemSymbolName: "hand.raised", accessibilityDescription: nil)
+        let submenu = NSMenu()
+        let note = NSMenuItem(title: "With the lid closed, how long to wait for your answer", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        submenu.addItem(note)
+        var choices = Self.waitChoices
+        if !choices.contains(waitMinutes) { choices.append(waitMinutes); choices.sort() }
+        for minutes in choices {
+            let title = "\(minutes) minutes" + (minutes == Self.defaultWaitMinutes ? "  (default)" : "")
+            let choice = NSMenuItem(title: title, action: #selector(chooseWaitMinutes(_:)), keyEquivalent: "")
+            choice.target = self
+            choice.tag = minutes
+            choice.state = minutes == waitMinutes ? .on : .off
+            submenu.addItem(choice)
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    @objc func chooseWaitMinutes(_ sender: NSMenuItem) {
+        UserDefaults.standard.set(sender.tag, forKey: "WaitMinutes")
+        appendLog("wait for input: \(sender.tag) min")
+        notify("Waiting for you: \(sender.tag) min",
+               "With the lid closed, an agent that needs your answer keeps the Mac awake \(sender.tag) minutes, then it sleeps.")
+    }
+
     @objc func choosePresetHotkey(_ sender: NSMenuItem) {
         useHotkey((sender.representedObject as? String).flatMap(Hotkey.parse))
     }
@@ -785,6 +827,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
         busyItem.submenu = busyMenu
         menu.addItem(busyItem)
 
+        menu.addItem(waitMenuItem())
         menu.addItem(hotkeyMenuItem())
         let login = NSMenuItem(title: "Open at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self

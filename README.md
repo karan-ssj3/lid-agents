@@ -39,8 +39,9 @@ agents keep 2h         # …with a 2-hour cap   (0 = no cap)
 agents keep --always   # even when no agent is busy (3h)
 agents pause           # normal lid-close sleep
 agents                 # status
-agents busy            # which agents count as busy, and in which folder
-agents integrate       # let Lid Agents see when Codex and OpenCode are busy
+agents busy            # which agents count as busy (or need you), and in which folder
+agents wait 10         # a closed Mac stays awake 10 min for an agent that needs you (default 3)
+agents integrate       # let Lid Agents see when Codex and OpenCode are busy, and when an agent needs you
 agents hotkey ctrl+opt+cmd+l   # change the hotkey (or none); applies within seconds
 agents update          # install the latest release
 ```
@@ -64,6 +65,22 @@ agents integrate
 
 Restart sessions that are already open to pick it up.
 
+## When an agent needs you
+
+An agent stopped on a permission prompt or a question isn't working: it's waiting for an answer. `agents integrate` tells Lid Agents when that happens, and the agent shows as **needs input** in `agents busy` and the cup's **Busy agents** menu.
+
+- **Lid closed:** the Mac stays awake for **3 minutes** by default, so you have a moment to answer, for example from your phone, and then it sleeps unless something else is still working. Choose the time under the cup → **When an agent needs you** (3, 10, 30 or 60 minutes), or run `agents wait 10`. It applies straight away, even to a keep that's already running.
+- **Lid open:** the agent counts as busy, because you may be there reading the prompt, so keep doesn't switch off under you.
+- **You answered:** anything the agent starts afterwards that runs for 10 seconds or more, such as an approved test suite or `gh run watch`, means it's working again, even before its next hook fires. So a closed Mac doesn't sleep partway through an approved task.
+
+| Agent | How it's told |
+|---|---|
+| Claude Code | Hooks in `~/.claude/settings.json`: its permission-prompt and question notifications mark it, its next event (a prompt, a tool finishing, the turn ending) clears it. |
+| Codex | Hooks in `hooks.json` in each Codex home: `PermissionRequest` and its `request_user_input` question tool mark it, the next event clears it. Codex asks you to review new hooks once (`/hooks` in a Codex session); Codex started by Superset runs them as they are. |
+| OpenCode | The same plugin, on `permission.asked` and `question.asked`. |
+
+The hooks run `agents mark` and do nothing else: they print nothing, always succeed, and are tagged `# lid-agents-hook`, so re-running `agents integrate` replaces them and `agents uninstall` removes them, leaving any other hooks alone. The first change to each file keeps a `.lid-agents.bak` copy next to it. An agent that's using CPU again, or has started a long-running command since the prompt, counts as busy straight away. Editing a settings file never replaces it: an unreadable or invalid file is left alone, a file that wouldn't change isn't rewritten, and its permissions are kept.
+
 ## Why this needs a tool
 
 macOS has two kinds of sleep:
@@ -85,7 +102,7 @@ The one switch that covers the lid is `pmset -a disablesleep 1`. It is global an
 | "Allow notifications" prompt | Notifications when you switch, and when it pauses itself | System Settings → Notifications → Lid Agents |
 | Nothing else | The hotkey uses `RegisterEventHotKey`, which needs **no** Accessibility or Input Monitoring permission. | — |
 
-Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from the one-liner), the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. `agents integrate`, which you run yourself, adds `~/.config/opencode/plugins/lid-agents.js` and sets `prevent_idle_sleep` in `~/.codex/config.toml`. The app is built from this repo by GitHub Actions, signed with a Developer ID and notarized by Apple, so Gatekeeper opens it without warnings however you install it.
+Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from the one-liner), the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. `agents integrate`, which you run yourself, adds `~/.config/opencode/plugins/lid-agents.js`, sets `prevent_idle_sleep` in `~/.codex/config.toml`, and adds tagged hooks to `~/.claude/settings.json` and `~/.codex/hooks.json`. The app is built from this repo by GitHub Actions, signed with a Developer ID and notarized by Apple, so Gatekeeper opens it without warnings however you install it.
 
 ## Settings
 
@@ -95,6 +112,7 @@ Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from 
 | Agents watched | `claude codex gemini aider opencode amp goose cursor-agent droid` | `AGENTS_NAMES` |
 | Idle minutes before pausing | 3 | `AGENTS_IDLE_MINUTES` |
 | CPU % that counts as busy (an agent plus its child processes) | 5 | `AGENTS_CPU` |
+| Minutes a closed Mac stays awake for an agent that needs your answer | 3 | The cup → **When an agent needs you**, `agents wait 10`, or `AGENTS_WAIT_MINUTES` |
 | Minutes an agent may sit "busy" at almost no CPU, usually waiting on you, before pausing | 30 | `AGENTS_QUIET_MINUTES` |
 | Hard cap (hours) | 8 | `AGENTS_HOURS`, or `agents keep 4h` |
 | Battery floor | 15% | `AGENTS_MIN_BATTERY` |
