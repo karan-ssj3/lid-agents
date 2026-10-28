@@ -90,7 +90,8 @@ Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from 
 | Hotkey | ⌃0 | The cup → **Hotkey** → pick a preset, **None**, or **Record New Hotkey…** and press the keys you want; or `agents hotkey ctrl+opt+cmd+l` in a terminal. It applies immediately. It needs ⌃, ⌥ or ⌘ with a letter, number or Space. |
 | Agents watched | `claude codex gemini aider opencode amp goose cursor-agent droid` | `AGENTS_NAMES` |
 | Idle minutes before pausing | 3 | `AGENTS_IDLE_MINUTES` |
-| CPU % that counts as busy | 5 | `AGENTS_CPU` |
+| CPU % that counts as busy (an agent plus its child processes) | 5 | `AGENTS_CPU` |
+| Minutes an agent may sit "busy" at almost no CPU, usually waiting on you, before pausing | 30 | `AGENTS_QUIET_MINUTES` |
 | Hard cap (hours) | 8 | `AGENTS_HOURS`, or `agents keep 4h` |
 | Battery floor | 15% | `AGENTS_MIN_BATTERY` |
 

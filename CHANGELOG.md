@@ -11,6 +11,13 @@
 - `agents` status shows the hotkey, whether the app is running, and when notifications are off (so switching shows no banner).
 - **Fixed:** the menu's **Busy agents** list left out the folder for agents that were busy through `caffeinate`.
 - `agents uninstall` also removes the OpenCode plugin.
+- **Child processes count.** An agent's CPU now includes everything it started, so a long test suite or build keeps it busy for every agent, including `codex exec`, Gemini CLI and Aider, with no setup.
+- **Waiting isn't working.** If every busy agent has held its signal for 30 minutes at almost no CPU (usually it's waiting for your approval, or an idle event went missing), Lid Agents pauses instead of keeping a closed Mac awake until the 8-hour cap. Change it with `AGENTS_QUIET_MINUTES`.
+- The OpenCode plugin's `caffeinate` expires after 5 minutes unless it's renewed, like Claude Code's, and can no longer stop OpenCode from exiting. Upgrading from the DMG now refreshes it too.
+- `agents uninstall` lists every Codex home where `prevent_idle_sleep` is still on, not just the default one.
+- If macOS refuses a hotkey, your working one stays and stays saved; the menu shows a hotkey that couldn't be registered at launch as unavailable, and re-running `agents hotkey` with the same keys retries it.
+- A menu bar position you ⌘-dragged the cup to before 1.1.0 is kept.
+- Agent detection reads full command lines only for `node`/`python`-style processes and skips `pmset` when no agent is running, so the 5-second refresh stays light.
 
 ## 1.0.6
 
