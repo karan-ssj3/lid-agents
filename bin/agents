@@ -9,7 +9,9 @@
 #   agents toggle                 switch between keep and pause
 #   agents                        status
 #   agents busy                   which agent processes count as busy right now
+#   agents hotkey [keys|none]     show or set the hotkey, e.g. agents hotkey ctrl+opt+cmd+l
 #   agents install                one-time: passwordless sudo for exactly two pmset commands
+#   agents integrate              let Lid Agents see when Codex and OpenCode are busy
 #   agents uninstall              remove everything Lid Agents installed
 #   agents update                 install the latest release
 #   agents version
@@ -20,7 +22,9 @@
 # the cap expires or the battery reaches the floor, and if the lid is shut then, sleeps the Mac.
 #
 # "Busy" = an agent CLI that has a caffeinate child (Claude Code holds `caffeinate -i -t 300`
-# only while working) or is using >= AGENTS_CPU % CPU. An open-but-idle session is not busy.
+# only while working; so does OpenCode with the Lid Agents plugin), holds a sleep assertion
+# itself (Codex with prevent_idle_sleep), or is using >= AGENTS_CPU % CPU. An open-but-idle
+# session is not busy. `agents integrate` sets up the Codex and OpenCode parts.
 
 set -u
 
@@ -33,11 +37,17 @@ LOG="$STATE_DIR/lid-agents.log"
 SUDOERS_FILE="/etc/sudoers.d/lid-agents"
 LAUNCH_AGENT="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 LINK="$HOME/.local/bin/agents"
+OPENCODE_PLUGIN="${XDG_CONFIG_HOME:-$HOME/.config}/opencode/plugins/lid-agents.js"
 
 MIN_BATTERY="${AGENTS_MIN_BATTERY:-15}"
 AGENT_NAMES="${AGENTS_NAMES:-claude codex gemini aider opencode amp goose cursor-agent droid}"
 CPU_THRESHOLD="${AGENTS_CPU:-5}"
 IDLE_MINUTES="${AGENTS_IDLE_MINUTES:-3}"
+# A "busy" signal (caffeinate child, sleep assertion) with almost no CPU across the agent and its
+# children for this long means it's waiting on the user (an approval prompt) or an idle event
+# was missed, so the guard pauses rather than keep a closed Mac awake until the cap.
+QUIET_MINUTES="${AGENTS_QUIET_MINUTES:-30}"
+QUIET_CPU="${AGENTS_QUIET_CPU:-1}"
 DEFAULT_HOURS="${AGENTS_HOURS:-8}"
 
 KEEP_TEXT="Lid closed → agents keep running"
@@ -48,6 +58,13 @@ SELF="$0"
 while [ -L "$SELF" ]; do SELF="$(readlink "$SELF")"; done
 APP_BUNDLE="${SELF%/Contents/Resources/agents}"
 [ "$APP_BUNDLE" = "$SELF" ] && APP_BUNDLE=""
+
+# The OpenCode plugin ships next to this script in the app, or in integrations/ in a checkout
+if [ -n "$APP_BUNDLE" ]; then
+  OPENCODE_PLUGIN_SRC="$APP_BUNDLE/Contents/Resources/opencode-lid-agents.js"
+else
+  OPENCODE_PLUGIN_SRC="$(dirname "$SELF")/../integrations/opencode/lid-agents.js"
+fi
 
 mkdir -p "$STATE_DIR"
 
@@ -71,21 +88,82 @@ lid_closed() { ioreg -r -k AppleClamshellState -d 1 | grep -q '"AppleClamshellSt
 
 guard_running() { [ -f "$GUARD_PID" ] && kill -0 "$(cat "$GUARD_PID")" 2>/dev/null; }
 
-# Prints "pid name why" for each busy agent. Names match the executable's basename exactly,
-# so the Claude desktop app ("Claude") and its helpers never count.
+# PIDs holding a power assertion that stops idle sleep, one per line. Codex holds one in its
+# own process while a turn runs (`codex features enable prevent_idle_sleep`).
+sleep_assertion_pids() {
+  pmset -g assertions 2>/dev/null | sed -nE \
+    's/^[[:space:]]*pid ([0-9]+)\(.*\): \[[^]]*\] [0-9:]+ (PreventUserIdleSystemSleep|PreventSystemSleep|NoIdleSleepAssertion) .*/\1/p'
+}
+
+# Prints "pid name why" for each busy agent, where why is always two words (the menu bar app
+# reads the folder from the fifth field). Names match the executable's basename exactly, so
+# the Claude desktop app ("Claude") and its helpers never count. Agents installed through
+# npm, bun or pip run as node/bun/python, so for those the script name in the command line
+# counts instead (`node /opt/homebrew/bin/gemini` is gemini). None of this depends on which
+# terminal or app started the agent. An agent is busy when:
+#   - it has a caffeinate child: Claude Code while working, OpenCode with the Lid Agents plugin
+#   - it holds a sleep assertion itself: Codex with prevent_idle_sleep on
+#   - it and its child processes use >= AGENTS_CPU % CPU together: anything else, including
+#     an agent whose work runs in children (a long test suite, `codex exec`)
+# `busy_agents --cpu` appends that combined CPU % as a last field (the guard's quiet check).
+INTERPRETERS='^(node|bun|deno|python[0-9.]*|Python|ruby)$'
 busy_agents() {
-  ps -axo pid=,ppid=,pcpu=,comm= | awk -v names="$AGENT_NAMES" -v thr="$CPU_THRESHOLD" '
+  local with_cpu="${1:-}" procs scan interp=""
+  procs="$(ps -axo pid=,ppid=,pcpu=,comm=)"
+  # One cheap pass first: is any agent (or interpreter that might be one) running at all?
+  scan="$(printf '%s\n' "$procs" | awk -v names="$AGENT_NAMES" -v interp="$INTERPRETERS" '
     BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    { c = $4; for (i = 5; i <= NF; i++) c = c " " $i; sub(/.*\//, "", c)
+      if (c in want) found = 1
+      if (c ~ interp) { found = 1; pids = pids (pids == "" ? "" : ",") $1 } }
+    END { print (found ? "yes" : "no"), pids }')"
+  [ "${scan%% *}" = "yes" ] || return 0
+  interp="${scan#* }"
+  {
+    printf '%s\n' "$procs"
+    # Full command lines only for interpreter processes, never every process on the Mac
+    if [ -n "$interp" ]; then ps -ww -o pid=,args= -p "$interp" 2>/dev/null | sed 's/^ */args /'; fi
+    sleep_assertion_pids | sed 's/^/assertion /'
+  } |
+  awk -v names="$AGENT_NAMES" -v thr="$CPU_THRESHOLD" -v interp="$INTERPRETERS" -v with_cpu="$with_cpu" '
+    function base(s) { sub(/.*\//, "", s); return s }
+    # CPU of a process plus all its descendants (depth-limited against pid reuse cycles)
+    function tree_cpu(p, depth,    total, n, i, kid) {
+      total = cpu[p] + 0
+      if (depth > 32) return total
+      n = split(kids[p], kid, " ")
+      for (i = 1; i <= n; i++) total += tree_cpu(kid[i], depth + 1)
+      return total
+    }
+    BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+    $1 == "assertion" { asserted[$2] = 1; next }
+    $1 == "args" {
+      pid = $2
+      if (!(pid in name) || name[pid] !~ interp) next
+      # argv[0] (a process title such as "claude"), else the first non-flag argument
+      for (i = 3; i <= NF; i++) {
+        if (i > 3 && $i ~ /^-/) continue
+        if (base($i) in want) { name[pid] = base($i); agent[pid] = 1; break }
+        if (i > 3) break
+      }
+      next
+    }
     {
       pid = $1; ppid[pid] = $2; cpu[pid] = $3
+      if (pid != $2) kids[$2] = kids[$2] " " pid
       comm = $4; for (i = 5; i <= NF; i++) comm = comm " " $i
-      sub(/.*\//, "", comm); name[pid] = comm
-      if (comm in want) agent[pid] = 1
+      name[pid] = base(comm)
+      if (name[pid] in want) agent[pid] = 1
     }
     END {
-      for (p in name) if (name[p] == "caffeinate" && (ppid[p] in agent)) why[ppid[p]] = "caffeinate"
-      for (p in agent) if (!(p in why) && cpu[p] + 0 >= thr) why[p] = "cpu " cpu[p] "%"
-      for (p in why) print p, name[p], why[p]
+      for (p in agent) total[p] = tree_cpu(p, 0)
+      for (p in name) if (name[p] == "caffeinate" && (ppid[p] in agent)) why[ppid[p]] = "caffeinate child"
+      for (p in agent) if (!(p in why) && (p in asserted)) why[p] = "sleep assertion"
+      for (p in agent) if (!(p in why) && total[p] >= thr) why[p] = sprintf("cpu %.1f%%", total[p])
+      for (p in why) {
+        if (with_cpu == "--cpu") print p, name[p], why[p], sprintf("%.1f", total[p])
+        else print p, name[p], why[p]
+      }
     }'
 }
 
@@ -113,6 +191,7 @@ start_guard() {
   (
     trap 'exit 0' TERM
     idle=0
+    quiet=0
     while sleep 60; do
       keeping || exit 0                             # paused elsewhere
       reason=""
@@ -121,8 +200,23 @@ start_guard() {
       elif on_battery && [ "$(battery_pct)" -le "$MIN_BATTERY" ]; then
         reason="battery at $(battery_pct)% (floor ${MIN_BATTERY}%)"
       elif [ "$mode" = "busy" ]; then
-        if [ -n "$(busy_agents)" ]; then idle=0; else idle=$((idle + 1)); fi
-        [ "$idle" -ge "$IDLE_MINUTES" ] && reason="no agent busy for ${IDLE_MINUTES} min"
+        report="$(busy_agents --cpu)"
+        if [ -z "$report" ]; then
+          idle=$((idle + 1)); quiet=0
+        else
+          idle=0
+          # every busy agent is near 0% CPU (with its children): waiting, not working
+          if printf '%s\n' "$report" | awk -v q="$QUIET_CPU" '$NF + 0 >= q { active = 1 } END { exit active }'; then
+            quiet=$((quiet + 1))
+          else
+            quiet=0
+          fi
+        fi
+        if [ "$idle" -ge "$IDLE_MINUTES" ]; then
+          reason="no agent busy for ${IDLE_MINUTES} min"
+        elif [ "$quiet" -ge "$QUIET_MINUTES" ]; then
+          reason="agents waiting with no activity for ${QUIET_MINUTES} min (probably on you)"
+        fi
       fi
       if [ -n "$reason" ]; then
         if set_flag 0; then
@@ -189,6 +283,13 @@ cmd_status() {
   fi
   echo "  busy:    $(busy_count) agent(s)"
   echo "  battery: $(battery_pct)% $(on_battery && echo '(on battery)' || echo '(on AC)') · lid $(lid_closed && echo closed || echo open)"
+  echo "  hotkey:  $(current_hotkey)"
+  if ! pgrep -x LidAgents >/dev/null; then
+    echo "  app:     not running (open Lid Agents from Applications or Spotlight)"
+  fi
+  if [ "$(cat "$STATE_DIR/notifications" 2>/dev/null)" = "denied" ]; then
+    echo "  notices: off, so switching shows no banner. System Settings → Notifications → Lid Agents"
+  fi
   if ! has_sudo_rule; then echo "  setup:   incomplete (agents install)"; fi
   if [ -f "$LOG" ]; then echo "  last:    $(tail -1 "$LOG")"; fi
 }
@@ -206,7 +307,7 @@ cmd_busy() {
   local out; out="$(busy_agents)"
   if [ -z "$out" ]; then echo "No busy agents (watching: $AGENT_NAMES)"; return 0; fi
   echo "$out" | while read -r pid name why; do
-    printf '%-7s %-10s %-14s %s\n' "$pid" "$name" "$why" "$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+    printf '%-7s %-10s %-16s %s\n' "$pid" "$name" "$why" "$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
   done
 }
 
@@ -245,16 +346,126 @@ cmd_update() {
   curl -fsSL "https://github.com/$repo/releases/download/v$latest/install.sh" | LID_AGENTS_VERSION="$latest" bash
 }
 
+current_hotkey() { defaults read "$BUNDLE_ID" Hotkey 2>/dev/null || echo "ctrl+0"; }
+
+# The menu bar app picks a changed Hotkey default up within a few seconds, no restart needed
+cmd_hotkey() {
+  local spec="${1:-}"
+  if [ -z "$spec" ]; then
+    echo "Hotkey: $(current_hotkey)"
+    echo "  change it: agents hotkey ctrl+opt+cmd+l   (⌃, ⌥ or ⌘ plus a letter, number or space; or none)"
+    return 0
+  fi
+  spec="$(printf '%s' "$spec" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+  if [ "$spec" != "none" ]; then
+    if ! printf '%s' "$spec" | grep -Eq '^((ctrl|control|opt|option|alt|shift|cmd|command)\+)+([a-z0-9]|space)$' \
+       || ! printf '%s' "$spec" | grep -Eq '(^|\+)(ctrl|control|opt|option|alt|cmd|command)\+'; then
+      echo "agents: '$1' isn't a hotkey. Use ⌃, ⌥ or ⌘ with a letter, number or space, e.g. ctrl+opt+cmd+l" >&2
+      exit 1
+    fi
+  fi
+  defaults write "$BUNDLE_ID" Hotkey "$spec"
+  # The stamp makes the app re-apply even an unchanged spec, so re-running retries one that failed
+  defaults write "$BUNDLE_ID" HotkeyRequested -float "$(date +%s)"
+  if pgrep -x LidAgents >/dev/null; then
+    echo "Hotkey: $spec. The menu bar app switches to it within a few seconds."
+  else
+    echo "Hotkey: $spec. It applies when Lid Agents next opens."
+  fi
+}
+
+# Every Codex home that exists, once each: $CODEX_HOME, ~/.codex, and the one Superset launches
+# Codex with. prevent_idle_sleep is a per-home setting, so integrate and uninstall share this.
+codex_homes() {
+  local home seen=""
+  while IFS= read -r home; do
+    [ -n "$home" ] && [ -d "$home" ] || continue
+    case "$seen" in *"|$home|"*) continue ;; esac
+    seen="$seen|$home|"
+    printf '%s\n' "$home"
+  done <<EOF
+${CODEX_HOME:-}
+$HOME/.codex
+$(cat "$HOME/.superset/state/default-codex-home" 2>/dev/null)
+EOF
+}
+
+codex_sleep_feature_on() {   # codex_sleep_feature_on <home>
+  [ "$(CODEX_HOME="$1" codex features list 2>/dev/null | awk '$1 == "prevent_idle_sleep" {print $NF}')" = "true" ]
+}
+
+# Copies the bundled OpenCode plugin over an installed one, so upgrades (install.sh, the app's
+# Update item, or dragging a new app out of the DMG) never leave an old plugin loaded.
+refresh_opencode_plugin() {
+  [ -f "$OPENCODE_PLUGIN" ] && [ -f "$OPENCODE_PLUGIN_SRC" ] || return 0
+  cmp -s "$OPENCODE_PLUGIN_SRC" "$OPENCODE_PLUGIN" && return 0
+  cp "$OPENCODE_PLUGIN_SRC" "$OPENCODE_PLUGIN" && log "refreshed OpenCode plugin"
+}
+
+cmd_integrate() {
+  # --refresh: quiet upgrade step, run by install.sh and the app at launch; changes nothing new
+  if [ "${1:-}" = "--refresh" ]; then refresh_opencode_plugin; return 0; fi
+
+  # Codex: its own prevent_idle_sleep feature holds a sleep assertion in the codex process
+  # for exactly as long as a turn runs (interactive sessions; `codex exec` doesn't take one,
+  # but its child processes' CPU still counts). Apps can launch Codex with their own
+  # CODEX_HOME (Superset does for extra accounts), so switch it on in every home we find.
+  if command -v codex >/dev/null 2>&1; then
+    local home ok=0
+    while IFS= read -r home; do
+      if CODEX_HOME="$home" codex features enable prevent_idle_sleep >/dev/null 2>&1; then
+        echo "Codex:    prevent_idle_sleep is on in $home"
+        ok=1
+      else
+        echo "Codex:    couldn't switch it on in $home. Run:  CODEX_HOME='$home' codex features enable prevent_idle_sleep" >&2
+      fi
+    done < <(codex_homes)
+    if [ "$ok" = 1 ]; then
+      echo "          Codex now marks itself busy while a turn runs. Restart open sessions to pick it up."
+    fi
+  else
+    echo "Codex:    not found on PATH, skipped."
+  fi
+
+  # OpenCode: a plugin that holds caffeinate while any session is busy
+  if command -v opencode >/dev/null 2>&1 || [ -d "$(dirname "$(dirname "$OPENCODE_PLUGIN")")" ]; then
+    if [ ! -f "$OPENCODE_PLUGIN_SRC" ]; then
+      echo "OpenCode: plugin missing from this install ($OPENCODE_PLUGIN_SRC)" >&2
+    else
+      mkdir -p "$(dirname "$OPENCODE_PLUGIN")"
+      cp "$OPENCODE_PLUGIN_SRC" "$OPENCODE_PLUGIN"
+      echo "OpenCode: installed $OPENCODE_PLUGIN"
+      echo "          Sessions already open pick it up when you restart them."
+    fi
+  else
+    echo "OpenCode: not found, skipped."
+  fi
+  touch "$STATE_DIR/integrated"      # install.sh stops suggesting `agents integrate`
+  log "integrate"
+}
+
 cmd_uninstall() {
   if keeping && has_sudo_rule; then cmd_pause >/dev/null; fi
   stop_guard
   pkill -x LidAgents 2>/dev/null
   rm -f "$LAUNCH_AGENT"
   if [ -f "$SUDOERS_FILE" ]; then as_root "rm -f '$SUDOERS_FILE'" && echo "Removed $SUDOERS_FILE"; fi
+  if [ -f "$OPENCODE_PLUGIN" ]; then rm -f "$OPENCODE_PLUGIN" && echo "Removed $OPENCODE_PLUGIN"; fi
   if [ -L "$LINK" ]; then rm -f "$LINK"; fi
   if [ -n "$APP_BUNDLE" ] && [ -d "$APP_BUNDLE" ]; then rm -rf "$APP_BUNDLE" && echo "Removed $APP_BUNDLE"; fi
   rm -rf "$STATE_DIR"
   echo "Lid Agents is uninstalled. Closing the lid sleeps the Mac as normal."
+  if command -v codex >/dev/null 2>&1; then
+    local home header=0
+    while IFS= read -r home; do
+      codex_sleep_feature_on "$home" || continue
+      if [ "$header" = 0 ]; then
+        echo "Codex's prevent_idle_sleep is still on (a Codex setting that \`agents integrate\` switched on). To turn it off:"
+        header=1
+      fi
+      echo "  CODEX_HOME='$home' codex features disable prevent_idle_sleep"
+    done < <(codex_homes)
+  fi
 }
 
 case "${1:-status}" in
@@ -265,8 +476,10 @@ case "${1:-status}" in
   state)      cmd_state ;;
   busy)       cmd_busy ;;
   install)    cmd_install ;;
+  integrate)  shift; cmd_integrate "$@" ;;
+  hotkey)     shift; cmd_hotkey "$@" ;;
   uninstall)  cmd_uninstall ;;
   update)     cmd_update ;;
   version|--version|-v) echo "lid-agents $AGENTS_VERSION" ;;
-  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || exit 1 ;;
+  *) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; [ "${1:-}" = "help" ] || [ "${1:-}" = "--help" ] || exit 1 ;;
 esac

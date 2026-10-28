@@ -28,6 +28,7 @@ echo "==> Bundling $VERSION"
 sed "s/__VERSION__/$VERSION/g" app/Info.plist > "$APP/Contents/Info.plist"
 sed "s/^AGENTS_VERSION=.*/AGENTS_VERSION=\"$VERSION\"/" bin/agents > "$APP/Contents/Resources/agents"
 chmod 755 "$APP/Contents/Resources/agents"
+cp integrations/opencode/lid-agents.js "$APP/Contents/Resources/opencode-lid-agents.js"
 
 echo "==> Icon"
 swift assets/make_icon.swift build/AppIcon.iconset

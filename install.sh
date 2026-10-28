@@ -82,6 +82,10 @@ fi
 ln -sfn "$APP/Contents/Resources/agents" "$LINK"
 step "Linked the \`agents\` command: $LINK"
 
+# An upgrade refreshes the OpenCode plugin if `agents integrate` installed it earlier
+# (the app does the same at launch, which covers upgrades from the DMG)
+"$LINK" integrate --refresh
+
 # 4. The one permission that needs your password
 step "Allowing \`pmset -a disablesleep 0|1\` without a password (nothing else)"
 "$LINK" install
@@ -110,6 +114,9 @@ bold "Lid Agents $("$LINK" version | awk '{print $2}') is installed."
 echo "  • Click the cup in the menu bar, or press $hotkey, to keep agents running with the lid closed."
 echo "  • macOS will ask whether \"Lid Agents\" can send notifications: click Allow."
 echo "  • In a terminal: agents keep · agents pause · agents (status) · agents uninstall"
+if ! [ -f "$HOME/.cache/lid-agents/integrated" ] && { command -v codex || command -v opencode; } >/dev/null 2>&1; then
+  echo "  • Use Codex or OpenCode? Run \`agents integrate\` so Lid Agents can tell when they're busy."
+fi
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *) echo

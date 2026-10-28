@@ -313,7 +313,7 @@ final class HotkeyRecorder: NSObject, NSWindowDelegate {
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUserNotificationCenterDelegate {
-    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    var statusItem: NSStatusItem!
     let menu = NSMenu()
     var hotkey = Hotkey.configured
     var recorder: HotkeyRecorder?
@@ -323,20 +323,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var updateTimer: Timer?
     var availableUpdate: String?
     var updating = false
+    var appliedHotkeySpec: String?      // the Hotkey default last applied, to spot `agents hotkey` changes
+    var appliedHotkeyStamp = 0.0        // HotkeyRequested last applied: `agents hotkey` re-run with the same keys
+    var unavailableHotkey: Hotkey?      // the configured hotkey macOS refused at launch (nothing registered)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if moveToApplicationsIfNeeded() { return }
+        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+        statusItem = makeStatusItem()
         menu.delegate = self
         statusItem.menu = menu
         statusItem.button?.imagePosition = .imageLeading
 
         hotkeyHandler = { [weak self] in self?.toggle() }
-        setGlobalHotkey(hotkey)
+        appliedHotkeySpec = UserDefaults.standard.string(forKey: "Hotkey")
+        appliedHotkeyStamp = UserDefaults.standard.double(forKey: "HotkeyRequested")
+        if let wanted = hotkey, !setGlobalHotkey(wanted) {
+            // Keep the choice saved (the other app may let go of it) but don't show it as working
+            unavailableHotkey = wanted
+            hotkey = nil
+            appendLog("hotkey \(wanted.spec) unavailable: another app has it")
+        }
 
         let center = UNUserNotificationCenter.current()
         center.delegate = self
         center.requestAuthorization(options: [.alert]) { [weak self] granted, _ in
+            // For `agents` status: without notifications, a switch by hotkey looks like nothing happened
+            try? (granted ? "allowed\n" : "denied\n").write(toFile: stateDir + "/notifications", atomically: true, encoding: .utf8)
             guard granted else { return }
+            // Posted only now, so it isn't dropped before notifications are allowed
+            DispatchQueue.main.async {
+                if let refused = self?.unavailableHotkey {
+                    self?.notify("\(refused.symbols) isn't available",
+                                 "Another app is using it. Pick one under the cup → Hotkey, or run `agents hotkey \(refused.spec)` to retry.")
+                }
+            }
             let defaults = UserDefaults.standard
             let lastRun = defaults.string(forKey: "LastRunVersion")
             defaults.set(Updater.current, forKey: "LastRunVersion")
@@ -405,6 +426,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     /// installs the pmset rule through the macOS administrator prompt.
     func finishSetupIfNeeded(force: Bool = false) {
         linkCommand()
+        // An upgrade from the DMG never runs install.sh: refresh an installed OpenCode plugin here
+        DispatchQueue.global(qos: .utility).async { Agents.run(["integrate", "--refresh"]) }
         let defaults = UserDefaults.standard
         // Already set up (curl install, or an earlier run): never re-ask, never touch Open at Login
         guard !Agents.state().setupOK else { defaults.set(true, forKey: "SetupDone"); return }
@@ -505,17 +528,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
     // MARK: Hotkey
 
-    /// Switches to `new` (nil = no hotkey), keeping the old one if macOS refuses it.
+    /// The one way the hotkey changes: the Hotkey menu, the recorder, and `agents hotkey`.
+    /// If macOS refuses `new`, the working hotkey stays registered and is written back to the
+    /// Hotkey default, so `agents` status and the next launch show what actually works.
     func useHotkey(_ new: Hotkey?) {
-        guard setGlobalHotkey(new) else {
+        if setGlobalHotkey(new) {
+            hotkey = new
+            unavailableHotkey = nil
+            saveHotkeySpec(new?.spec ?? "none")
+            appendLog("hotkey: \(new?.spec ?? "none")")
+            notify(new.map { "Hotkey: \($0.symbols)" } ?? "Hotkey off",
+                   new.map { "Press \($0.symbols) anywhere to switch." } ?? "Use the cup in the menu bar to switch.")
+        } else {
             setGlobalHotkey(hotkey)
-            notify("\(new?.symbols ?? "That hotkey") isn't available", "Another app is using it. Pick a different one.")
-            return
+            saveHotkeySpec(hotkey?.spec ?? unavailableHotkey?.spec ?? "none")
+            appendLog("hotkey \(new?.spec ?? "?") unavailable: another app has it")
+            let kept = hotkey.map { "\($0.symbols) stays" } ?? "No hotkey is set"
+            notify("\(new?.symbols ?? "That hotkey") isn't available", "Another app is using it. \(kept); pick a different one.")
         }
-        hotkey = new
-        UserDefaults.standard.set(new?.spec ?? "none", forKey: "Hotkey")
-        notify(new.map { "Hotkey: \($0.symbols)" } ?? "Hotkey off",
-               new.map { "Press \($0.symbols) anywhere to switch." } ?? "Use the cup in the menu bar to switch.")
+    }
+
+    func saveHotkeySpec(_ spec: String) {
+        UserDefaults.standard.set(spec, forKey: "Hotkey")
+        appliedHotkeySpec = spec
+    }
+
+    /// `agents hotkey <keys>` writes the Hotkey default (and a request stamp, so re-running it
+    /// with the same keys retries one that failed); apply it here without a restart.
+    func reloadHotkeyIfChanged() {
+        let defaults = UserDefaults.standard
+        let spec = defaults.string(forKey: "Hotkey")
+        let stamp = defaults.double(forKey: "HotkeyRequested")
+        guard spec != appliedHotkeySpec || stamp != appliedHotkeyStamp else { return }
+        appliedHotkeySpec = spec
+        appliedHotkeyStamp = stamp
+        let next = Hotkey.configured
+        if next == hotkey && unavailableHotkey == nil { return }   // already registered as asked
+        useHotkey(next)
     }
 
     @objc func choosePresetHotkey(_ sender: NSMenuItem) {
@@ -536,7 +585,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     func hotkeyMenuItem() -> NSMenuItem {
-        let item = NSMenuItem(title: "Hotkey: \(hotkey?.symbols ?? "None")", action: nil, keyEquivalent: "")
+        let label = hotkey?.symbols ?? unavailableHotkey.map { "\($0.symbols) (unavailable)" } ?? "None"
+        let item = NSMenuItem(title: "Hotkey: \(label)", action: nil, keyEquivalent: "")
         item.image = NSImage(systemSymbolName: "keyboard", accessibilityDescription: nil)
         let submenu = NSMenu()
         var specs = Hotkey.presets
@@ -591,9 +641,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     // MARK: State
 
     func refresh() {
+        reloadHotkeyIfChanged()
         DispatchQueue.global(qos: .utility).async {
             let next = Agents.state()
             DispatchQueue.main.async { self.apply(next) }
+        }
+    }
+
+    // MARK: Menu bar placement
+
+    static let cupName = "LidAgentsCup"
+    static let cupPreferredPosition = 0.0   // distance from the right end; the system items stay right of it
+
+    /// New menu bar items go to the left end of the right-hand group, which on a notched
+    /// display with a busy menu bar is behind the notch, so the cup was hidden. Ask for a spot
+    /// next to the system items instead; ⌘-dragging the cup later saves the user's own choice.
+    /// macOS only saves a position (or hidden state) when the user ⌘-drags the item, so a spot
+    /// chosen before 1.1.0, saved under the unnamed item's key, carries over; nothing is forced.
+    func makeStatusItem() -> NSStatusItem {
+        let defaults = UserDefaults.standard
+        let positionKey = "NSStatusItem Preferred Position \(Self.cupName)"
+        if defaults.object(forKey: positionKey) == nil {
+            let chosenBefore = defaults.object(forKey: "NSStatusItem Preferred Position Item-0")
+            defaults.set(chosenBefore ?? Self.cupPreferredPosition, forKey: positionKey)
+        }
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        item.autosaveName = Self.cupName
+        return item
+    }
+
+    func appendLog(_ message: String) {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let line = "\(formatter.string(from: Date())) \(message)\n"
+        if let handle = FileHandle(forWritingAtPath: logPath) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            handle.closeFile()
+        } else {
+            try? line.write(toFile: logPath, atomically: true, encoding: .utf8)
         }
     }
 
