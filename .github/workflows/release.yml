@@ -52,16 +52,64 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Version: $version"
 
+      # Releases are signed with the Developer ID and notarized. Pull requests (no secrets) build ad hoc.
+      - name: Import signing certificate
+        id: signing
+        env:
+          RELEASING: ${{ github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+        run: |
+          if [ -z "$MACOS_CERT_P12" ] || [ -z "$NOTARY_KEY_P8" ]; then
+            if [ "$RELEASING" = "true" ]; then
+              echo "::error::Signing secrets are missing; run scripts/setup-signing-secrets.sh. Refusing to publish an unsigned release."
+              exit 1
+            fi
+            echo "No signing secrets: building ad hoc."; exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          kc_pass="$(uuidgen)"
+          security create-keychain -p "$kc_pass" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$kc_pass" "$keychain"
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pass" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/cert.p12"
+          identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: .*\)"/\1/p' | head -1)"
+          [ -n "$identity" ] || { echo "::error::No Developer ID Application identity in the certificate"; exit 1; }
+          printf '%s' "$NOTARY_KEY_P8" > "$RUNNER_TEMP/notary.p8"
+          echo "identity=$identity" >> "$GITHUB_OUTPUT"
+          echo "Signing as: $identity"
+
       - name: Build
+        env:
+          SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          NOTARY_KEY_PATH: ${{ steps.signing.outputs.identity && format('{0}/notary.p8', runner.temp) || '' }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
         run: scripts/build.sh "${{ steps.version.outputs.version }}"
 
       - name: Smoke test
         run: |
-          app=build/LidAgents.app
+          app="build/Lid Agents.app"
+          if [ -n "${{ steps.signing.outputs.identity }}" ]; then
+            spctl -a -vv "$app"                                     # Gatekeeper: Notarized Developer ID
+            spctl -a -vv -t open --context context:primary-signature dist/LidAgents.dmg
+            xcrun stapler validate dist/LidAgents.dmg
+          fi
           lipo -info "$app/Contents/MacOS/LidAgents"
           "$app/Contents/Resources/agents" version
           "$app/Contents/Resources/agents" state
           "$app/Contents/Resources/agents" busy
+
+      - name: Remove signing material
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/cert.p12"
 
       - name: Publish release
         if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
@@ -76,5 +124,5 @@ jobs:
           if git rev-parse -q --verify "refs/tags/$tag" >/dev/null && [[ "$GITHUB_REF" != refs/tags/* ]]; then
             echo "$tag already exists; nothing to release"; exit 0
           fi
-          gh release create "$tag" dist/lid-agents.tar.gz install.sh \
+          gh release create "$tag" dist/LidAgents.dmg dist/lid-agents.tar.gz install.sh \
             --target "$GITHUB_SHA" --title "Lid Agents $tag" "$@"

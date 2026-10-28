@@ -6,11 +6,17 @@ Claude Code, Codex and other terminal agents stop the moment you close the lid, 
 
 No external display, no keyboard or mouse plugged in, no power adapter required.
 
+## Install
+
+**[Download Lid Agents (.dmg)](https://github.com/liam-machine/lid-agents/releases/latest/download/LidAgents.dmg)**, drag it into Applications and open it. On first launch it asks once for your password (see [Permissions](#permissions-and-exactly-what-the-installer-changes)), and then the cup appears in your menu bar.
+
+Or from a terminal:
+
 ```bash
 curl -fsSL https://github.com/liam-machine/lid-agents/releases/latest/download/install.sh | bash
 ```
 
-<sub>macOS 13 or later, Apple Silicon or Intel, on an administrator account. Free and MIT licensed.</sub>
+<sub>macOS 13 or later, Apple Silicon or Intel, on an administrator account. Signed with a Developer ID and notarized by Apple. Free and MIT licensed.</sub>
 
 ## How you use it
 
@@ -50,11 +56,11 @@ The one switch that covers the lid is `pmset -a disablesleep 1`. It is global an
 
 | What | Why | Where |
 |---|---|---|
-| Your password, **once** | Adds a sudoers rule allowing exactly `/usr/bin/pmset -a disablesleep 0` and `… 1`, nothing else. Sudo matches the arguments literally, so the rule can't be used for anything else. | `/etc/sudoers.d/lid-agents` |
+| Your password, **once** (the installer, or the app's first-launch prompt) | Adds a sudoers rule allowing exactly `/usr/bin/pmset -a disablesleep 0` and `… 1`, nothing else. Sudo matches the arguments literally, so the rule can't be used for anything else. | `/etc/sudoers.d/lid-agents` |
 | "Allow notifications" prompt | Notifications when you switch, and when it pauses itself | System Settings → Notifications → Lid Agents |
 | Nothing else | The hotkey uses `RegisterEventHotKey`, which needs **no** Accessibility or Input Monitoring permission. | — |
 
-Files: `~/Applications/LidAgents.app`, the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. The app is ad-hoc signed and built from this repo by GitHub Actions. Installing with `curl` doesn't mark it as downloaded, so Gatekeeper doesn't block it.
+Files: `Lid Agents.app` (in `/Applications` from the DMG, `~/Applications` from the one-liner), the `agents` link in `~/.local/bin`, a login item in `~/Library/LaunchAgents/io.github.liam-machine.lid-agents.plist`, and a log in `~/.cache/lid-agents/`. The app is built from this repo by GitHub Actions, signed with a Developer ID and notarized by Apple, so Gatekeeper opens it without warnings however you install it.
 
 ## Settings
 
@@ -92,7 +98,7 @@ This switches lid-close sleep back on and removes the app, the command, the logi
 
 ## Troubleshooting
 
-- **No cup in the menu bar.** Run `open ~/Applications/LidAgents.app`. If your menu bar is full, macOS hides extra icons; menu bar managers like Ice or Bartender can show it.
+- **No cup in the menu bar.** Open **Lid Agents** from Applications (or Spotlight). If your menu bar is full, macOS hides extra icons; menu bar managers like Ice or Bartender can show it.
 - **The hotkey does nothing.** Another app may have claimed the same combination. Pick a different one (see Settings).
 - **"Setup incomplete".** Run `agents install`.
 - **Want to see what happened while the lid was closed?** Run `cat ~/.cache/lid-agents/lid-agents.log`.
@@ -101,11 +107,11 @@ This switches lid-close sleep back on and removes the app, the command, the logi
 
 ```bash
 git clone https://github.com/liam-machine/lid-agents && cd lid-agents
-scripts/build.sh      # universal build/LidAgents.app + dist/lid-agents.tar.gz
+scripts/build.sh      # universal "build/Lid Agents.app", dist/LidAgents.dmg, dist/lid-agents.tar.gz
 ./install.sh          # installs the local build
 ```
 
-**Releasing.** Every merge to `main` that changes the app is built by GitHub Actions and published as the next patch release (latest tag + 1). Installed copies offer it within a day. Pushes that only change docs don't release.
+**Releasing.** Every merge to `main` that changes the app is built by GitHub Actions, signed, notarized and published as the next patch release (latest tag + 1), with the DMG, the tarball and `install.sh`. Installed copies offer it within a day. Pushes that only change docs don't release. CI won't publish an unsigned release: the signing secrets come from `scripts/setup-signing-secrets.sh`, a one-time step for maintainers.
 
 - Curated release notes: add a `## x.y.z` section to `CHANGELOG.md` before merging. Without one, GitHub writes the notes from the commits.
 - Minor or major bump: set `VERSION` to e.g. `1.1.0`.

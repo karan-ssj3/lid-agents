@@ -3,16 +3,26 @@
 #
 #   curl -fsSL https://github.com/liam-machine/lid-agents/releases/latest/download/install.sh | bash
 #
-# Installs ~/Applications/LidAgents.app (menu bar app), links the `agents` command into
-# ~/.local/bin, adds one sudoers rule allowing exactly `pmset -a disablesleep 0|1`, opens the
-# app at login, and starts it. Nothing else on the system changes. Re-run to upgrade.
-# Pin a version with LID_AGENTS_VERSION=1.0.0. From a checkout, `./install.sh` uses build/.
+# Installs "Lid Agents.app" (menu bar app; replaces an existing copy where it is, otherwise
+# ~/Applications), links the `agents` command into ~/.local/bin, adds one sudoers rule allowing
+# exactly `pmset -a disablesleep 0|1`, opens the app at login, and starts it. Nothing else on
+# the system changes. Re-run to upgrade. Pin a version with LID_AGENTS_VERSION=1.0.0; the app's
+# Update item passes LID_AGENTS_APP (its own path). From a checkout, `./install.sh` uses build/.
 set -euo pipefail
 
 REPO="liam-machine/lid-agents"
 VERSION="${LID_AGENTS_VERSION:-latest}"
 BUNDLE_ID="io.github.liam-machine.lid-agents"
-APP="$HOME/Applications/LidAgents.app"
+NAME="Lid Agents.app"
+OLD_APP="$HOME/Applications/LidAgents.app"    # the name before 1.0.6
+APP="${LID_AGENTS_APP:-}"
+if [ -z "$APP" ]; then
+  for candidate in "/Applications/$NAME" "$HOME/Applications/$NAME"; do
+    if [ -d "$candidate" ]; then APP="$candidate"; break; fi
+  done
+fi
+[ "$APP" = "$OLD_APP" ] && APP=""
+APP="${APP:-$HOME/Applications/$NAME}"
 BIN_DIR="$HOME/.local/bin"
 LINK="$BIN_DIR/agents"
 LAUNCH_AGENT="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
@@ -31,8 +41,8 @@ trap 'rm -rf "$tmp"' EXIT
 
 # 1. Get the app: a local build when run from a checkout, otherwise the GitHub release
 self="${BASH_SOURCE[0]:-}"
-if [ -n "$self" ] && [ -f "$self" ] && [ -d "$(dirname "$self")/build/LidAgents.app" ]; then
-  src="$(cd "$(dirname "$self")" && pwd)/build/LidAgents.app"
+if [ -n "$self" ] && [ -f "$self" ] && [ -d "$(dirname "$self")/build/$NAME" ]; then
+  src="$(cd "$(dirname "$self")" && pwd)/build/$NAME"
   step "Using local build: $src"
 else
   if [ "$VERSION" = "latest" ]; then
@@ -43,9 +53,10 @@ else
   step "Downloading $url"
   curl -fsSL "$url" -o "$tmp/lid-agents.tar.gz" || die "Download failed."
   tar -xzf "$tmp/lid-agents.tar.gz" -C "$tmp"
-  src="$tmp/LidAgents.app"
+  src="$tmp/$NAME"
+  [ -d "$src" ] || src="$tmp/LidAgents.app"     # releases before 1.0.6
 fi
-[ -x "$src/Contents/MacOS/LidAgents" ] || die "The download did not contain LidAgents.app."
+[ -x "$src/Contents/MacOS/LidAgents" ] || die "The download did not contain the Lid Agents app."
 
 # 2. Install the app (quit a running copy first so the upgrade takes)
 step "Installing $APP"
@@ -54,9 +65,10 @@ step "Installing $APP"
 pkill -a -x LidAgents 2>/dev/null || true
 for _ in $(seq 50); do pgrep -x LidAgents >/dev/null || break; sleep 0.1; done
 pkill -9 -a -x LidAgents 2>/dev/null || true
-mkdir -p "$HOME/Applications"
+mkdir -p "$(dirname "$APP")"
 rm -rf "$APP"
 ditto "$src" "$APP"
+if [ -d "$OLD_APP" ]; then rm -rf "$OLD_APP"; echo "    Removed the old $OLD_APP"; fi
 # Downloads through a browser are quarantined; curl's are not, but clear it either way
 xattr -dr com.apple.quarantine "$APP" 2>/dev/null || true
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$APP" 2>/dev/null || true

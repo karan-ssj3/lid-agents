@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.6
+
+- **Download a DMG.** Each release now includes `LidAgents.dmg`: drag Lid Agents into Applications and open it. No terminal needed.
+- **Signed and notarized.** The app and the DMG are signed with a Developer ID and notarized by Apple, so macOS opens them without a security warning.
+- **Setup inside the app.** On first launch the app finishes its own setup: it asks once for your password to allow `pmset -a disablesleep`, links the `agents` command and turns on Open at Login. Opened straight from the disk image, it offers to move itself into Applications. If you skip the password, **Finish Setup…** stays in the cup's menu.
+- The app is now called **Lid Agents.app**. Updates replace it wherever it's installed and remove the old `LidAgents.app`.
+
 ## 1.0.5
 
 - **The default hotkey is now ⌃0 (Control + 0)**: two keys, and not used by macOS, shells or Claude Code. If you never picked a hotkey, yours changes from ⌃⌥⌘A to ⌃0 with this update. If you did pick one, it stays. ⌃⌥⌘A is still one click away under the cup → **Hotkey**.

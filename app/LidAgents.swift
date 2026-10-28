@@ -116,9 +116,14 @@ enum Updater {
         try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
+        // Replace this copy wherever it lives (/Applications for DMG installs, ~/Applications for curl)
+        var env = ProcessInfo.processInfo.environment
+        env["LID_AGENTS_VERSION"] = version
+        env["LID_AGENTS_APP"] = Bundle.main.bundlePath
+        process.environment = env
         process.arguments = ["-c", """
             curl -fsSL https://github.com/\(repo)/releases/download/v\(version)/install.sh \
-              | LID_AGENTS_VERSION=\(version) bash >> "\(logPath)" 2>&1
+              | bash >> "\(logPath)" 2>&1
             """]
         try? process.run()
     }
@@ -320,6 +325,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     var updating = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if moveToApplicationsIfNeeded() { return }
         menu.delegate = self
         statusItem.menu = menu
         statusItem.button?.imagePosition = .imageLeading
@@ -346,12 +352,122 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
 
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.refresh() }
+        DispatchQueue.main.async { self.finishSetupIfNeeded() }
 
         // Check at launch, then whenever a day has passed since the last check
         checkForUpdates(manual: false)
         updateTimer = Timer.scheduledTimer(withTimeInterval: 3600, repeats: true) { [weak self] _ in
             let last = UserDefaults.standard.double(forKey: "LastUpdateCheck")
             if Date().timeIntervalSince1970 - last > 86_400 { self?.checkForUpdates(manual: false) }
+        }
+    }
+
+    // MARK: First-run setup (a DMG install never runs install.sh, so the app does its part)
+
+    /// Opened straight from the disk image: offer to copy into /Applications and relaunch there.
+    /// True when this copy is quitting.
+    func moveToApplicationsIfNeeded() -> Bool {
+        let here = Bundle.main.bundlePath
+        guard here.hasPrefix("/Volumes/") else { return false }
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Move Lid Agents to Applications?"
+        alert.informativeText = "It's running from the disk image, which goes away when you eject it."
+        alert.addButton(withTitle: "Move to Applications")
+        alert.addButton(withTitle: "Quit")
+        guard alert.runModal() == .alertFirstButtonReturn else { NSApp.terminate(nil); return true }
+
+        let target = "/Applications/" + (here as NSString).lastPathComponent
+        do {
+            if FileManager.default.fileExists(atPath: target) {
+                NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+                    .filter { $0.processIdentifier != getpid() }.forEach { $0.terminate() }
+                try FileManager.default.removeItem(atPath: target)
+            }
+            try FileManager.default.copyItem(atPath: here, toPath: target)
+        } catch {
+            let failed = NSAlert()
+            failed.messageText = "Couldn't copy Lid Agents"
+            failed.informativeText = "Drag it into Applications from the disk image instead.\n\n\(error.localizedDescription)"
+            failed.runModal()
+            NSApp.terminate(nil)
+            return true
+        }
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: URL(fileURLWithPath: target), configuration: config) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+        return true
+    }
+
+    /// Links the `agents` command, turns on Open at Login, and (once, with the user's OK)
+    /// installs the pmset rule through the macOS administrator prompt.
+    func finishSetupIfNeeded(force: Bool = false) {
+        linkCommand()
+        let defaults = UserDefaults.standard
+        // Already set up (curl install, or an earlier run): never re-ask, never touch Open at Login
+        guard !Agents.state().setupOK else { defaults.set(true, forKey: "SetupDone"); return }
+        guard force || !defaults.bool(forKey: "SetupDone") else { return }
+
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Finish setting up Lid Agents"
+        alert.informativeText = """
+            To keep agents running with the lid closed, Lid Agents needs to run one command \
+            as administrator: pmset -a disablesleep (on or off). Nothing else.
+
+            macOS will ask for your password once.
+            """
+        alert.addButton(withTitle: "Continue")
+        alert.addButton(withTitle: "Not Now")
+        defaults.set(true, forKey: "SetupDone")      // ask once; "Finish Setup…" stays in the menu
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if !force && !FileManager.default.fileExists(atPath: launchAgentPath) { setOpenAtLogin(true) }
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            let result = Agents.run(["install"])
+            let next = Agents.state()
+            DispatchQueue.main.async {
+                self.apply(next)
+                if next.setupOK {
+                    let how = self.hotkey.map { "Press \($0.symbols) or click" } ?? "Click"
+                    self.notify("Lid Agents is set up", "\(how) the cup in the menu bar to keep agents running with the lid closed.")
+                } else {
+                    let message = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                    self.notify("Setup didn't finish", message.isEmpty ? "Try Finish Setup… in the cup's menu." : message)
+                }
+            }
+        }
+    }
+
+    @objc func finishSetup() { finishSetupIfNeeded(force: true) }
+
+    /// ~/.local/bin/agents → the script inside this bundle (moving aside anything that isn't ours)
+    func linkCommand() {
+        let fm = FileManager.default
+        let link = NSHomeDirectory() + "/.local/bin/agents"
+        if let target = try? fm.destinationOfSymbolicLink(atPath: link), target == Agents.script { return }
+        try? fm.createDirectory(atPath: (link as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+        if (try? fm.destinationOfSymbolicLink(atPath: link)) != nil {
+            try? fm.removeItem(atPath: link)
+        } else if fm.fileExists(atPath: link) {
+            try? fm.moveItem(atPath: link, toPath: link + ".bak")
+        }
+        try? fm.createSymbolicLink(atPath: link, withDestinationPath: Agents.script)
+    }
+
+    func setOpenAtLogin(_ on: Bool) {
+        guard on else { try? FileManager.default.removeItem(atPath: launchAgentPath); return }
+        let plist: [String: Any] = [
+            "Label": bundleID,
+            "ProgramArguments": ["/usr/bin/open", "-a", Bundle.main.bundlePath],
+            "RunAtLoad": true,
+        ]
+        try? FileManager.default.createDirectory(atPath: (launchAgentPath as NSString).deletingLastPathComponent,
+                                                 withIntermediateDirectories: true)
+        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+            FileManager.default.createFile(atPath: launchAgentPath, contents: data)
         }
     }
 
@@ -558,7 +674,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
             info("Lid closed → Mac sleeps, agents pause", symbol: "moon.zzz")
         }
         info("\(state.busy) agent\(state.busy == 1 ? "" : "s") busy · battery \(state.battery)%\(state.onBattery ? "" : " (charging)")")
-        if !state.setupOK { info("Setup incomplete: run `agents install`", symbol: "exclamationmark.triangle") }
+        if !state.setupOK {
+            action("Finish Setup… (needs your password once)", #selector(finishSetup), symbol: "exclamationmark.triangle.fill")
+        }
         menu.addItem(.separator())
 
         if state.keeping {
@@ -606,20 +724,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, UNUser
     }
 
     @objc func toggleLogin() {
-        if FileManager.default.fileExists(atPath: launchAgentPath) {
-            try? FileManager.default.removeItem(atPath: launchAgentPath)
-            return
-        }
-        let plist: [String: Any] = [
-            "Label": bundleID,
-            "ProgramArguments": ["/usr/bin/open", "-a", Bundle.main.bundlePath],
-            "RunAtLoad": true,
-        ]
-        try? FileManager.default.createDirectory(atPath: (launchAgentPath as NSString).deletingLastPathComponent,
-                                                 withIntermediateDirectories: true)
-        if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
-            FileManager.default.createFile(atPath: launchAgentPath, contents: data)
-        }
+        setOpenAtLogin(!FileManager.default.fileExists(atPath: launchAgentPath))
     }
 }
 
